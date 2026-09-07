@@ -57,6 +57,12 @@ pub struct SampledFile<'a> {
 /// exactly that, so the count travels with the representative instead. The
 /// total is reported separately, and an exact path can always be classified
 /// with check_index_coverage.
+///
+/// The largest groups come first, because deduplicating is not enough on its
+/// own. Cutting the alphabetical head of the deduplicated list is how a report
+/// on one project showed three skipped files in `backend/docs` and never
+/// mentioned the 202 in `mobile/lib`, which were 46% of everything it had left
+/// out. A sample that hides the biggest gap fails at the one job it has.
 pub fn sample_files(files: &[FileRecord], cap: usize) -> Vec<SampledFile<'_>> {
     let mut chosen: Vec<SampledFile> = Vec::new();
     let mut index = BTreeMap::new();
@@ -79,6 +85,12 @@ pub fn sample_files(files: &[FileRecord], cap: usize) -> Vec<SampledFile<'_>> {
         }
     }
 
+    // Path breaks ties so the same repository always reports the same sample.
+    chosen.sort_by(|a, b| {
+        b.others_like_it
+            .cmp(&a.others_like_it)
+            .then_with(|| a.file.path.cmp(&b.file.path))
+    });
     chosen.truncate(cap);
     chosen
 }
@@ -282,6 +294,82 @@ mod tests {
         ];
 
         assert_eq!(super::sample_files(&files, 5).len(), 2);
+    }
+
+    /// The case this ordering exists for, at the shape it was found in: a
+    /// handful of files in directories that sort early, and the real gap in
+    /// `mobile/`, which an alphabetical cut dropped off the end.
+    #[test]
+    fn the_biggest_gap_cannot_be_cut_off_by_the_cap() {
+        let mut files = Vec::new();
+        for early in ["backend/docs", "backend/internal", "deploy", "deploy/pg"] {
+            for n in 0..3 {
+                files.push(skipped(
+                    &format!("{early}/thing-{n}.json"),
+                    CoverageReason::UnsupportedLanguage,
+                ));
+            }
+        }
+        for n in 0..202 {
+            files.push(skipped(
+                &format!("mobile/lib/widget-{n:03}.dart"),
+                CoverageReason::UnsupportedLanguage,
+            ));
+        }
+
+        let picked = super::sample_files(&files, 3);
+        let paths: Vec<&str> = picked.iter().map(|s| s.file.path.as_str()).collect();
+
+        assert!(
+            paths[0].starts_with("mobile/lib/"),
+            "the largest group must lead the sample: {paths:?}"
+        );
+        assert_eq!(
+            picked[0].others_like_it, 201,
+            "and must say how much it stands for"
+        );
+    }
+
+    /// Ordering by size must not cost the diversity that the deduplication was
+    /// added for: every remaining slot still goes to a different situation.
+    #[test]
+    fn ordering_by_size_still_shows_distinct_situations() {
+        let mut files = Vec::new();
+        for n in 0..20 {
+            files.push(skipped(
+                &format!("docs/mocks/shot-{n:02}.png"),
+                CoverageReason::Binary,
+            ));
+        }
+        files.push(skipped("Makefile", CoverageReason::UnsupportedLanguage));
+        files.push(skipped("src/big.bin", CoverageReason::Oversized));
+
+        let picked = super::sample_files(&files, 3);
+        let paths: Vec<&str> = picked.iter().map(|s| s.file.path.as_str()).collect();
+
+        assert_eq!(paths.len(), 3, "{paths:?}");
+        assert!(
+            paths.contains(&"Makefile") && paths.contains(&"src/big.bin"),
+            "a group of one is still a situation worth reporting: {paths:?}"
+        );
+    }
+
+    /// Two groups of the same size would otherwise come back in whichever
+    /// order the map happened to yield, and a report that moves on its own is
+    /// one nobody can diff.
+    #[test]
+    fn groups_of_equal_size_are_ordered_the_same_way_every_time() {
+        let files = vec![
+            skipped("zeta/a.png", CoverageReason::Binary),
+            skipped("zeta/b.png", CoverageReason::Binary),
+            skipped("alpha/a.png", CoverageReason::Binary),
+            skipped("alpha/b.png", CoverageReason::Binary),
+        ];
+
+        let picked = super::sample_files(&files, 5);
+        let paths: Vec<&str> = picked.iter().map(|s| s.file.path.as_str()).collect();
+
+        assert_eq!(paths, vec!["alpha/a.png", "zeta/a.png"]);
     }
 
     #[test]

@@ -16,7 +16,7 @@ whether it came from the AST or from a language server. See [Honest limits](#hon
 Requires a Linux x86_64 machine and a Rust toolchain to build.
 
 ```bash
-git clone <this-repo> loci && cd loci
+git clone https://github.com/bodsink/loci loci && cd loci
 cargo build --release
 ./target/release/loci install
 ```
@@ -101,10 +101,10 @@ enclosing definition, then the symbol. For example
 
 ## Languages
 
-Twenty language IDs have a real tree-sitter grammar linked into the binary.
+Twenty-one language IDs have a real tree-sitter grammar linked into the binary.
 
 Code: Python · JavaScript · JSX · TypeScript · TSX · Go · Rust · C · C++ · Java · C# · Kotlin ·
-Perl · Shell
+Perl · Shell · Dart
 
 Configuration: TOML · YAML · INI
 
@@ -122,6 +122,33 @@ Shell is included because packaging trees are mostly shell: build scripts, and D
 scripts like `postinst` that carry no extension at all. Those are found by their `#!` line, which is
 read only for extensionless files. `source lib.sh` and `. lib.sh` become import edges rather than
 calls to a function named `source`, with the target resolved against the script's own directory.
+
+### Dart
+
+Dart is here because a Flutter application is application code, not
+configuration: 244 files in one project, 202 of them under `mobile/lib`, and
+none of it visible. It is parsed only — Dart is not in the Hybrid LSP scope, so
+`hybrid_lsp_eligible` reports false.
+
+Dart spells a method and a top-level function with the same `function_signature`
+node, so the two are told apart by the body they sit in, through the same
+`method_parents` mechanism the other languages use. Getters and setters count as
+methods, because a Dart model class exposes most of itself through them and
+leaving them out would lose the larger half of a type. A `mixin` is a `Trait`,
+which is what the label means here; an `extension` is a `Class`, being a named
+container of methods with nothing closer available. `extends`, `with` and
+`implements` all produce type edges, since all three are ways of taking a type
+on and "what implements this" has to walk every one.
+
+On the project this was measured against, 244 files parse with zero errors and
+contribute 5,869 nodes: 3,082 fields, 1,490 methods, 700 classes, 555 functions
+and 34 enums.
+
+Imports are the honest gap. Dart's own package is addressed as
+`package:goinfracloud/...`, and 974 of that project's imports are written that
+way; resolving them needs the package name from `pubspec.yaml`, which the
+indexer does not read yet. Path imports do resolve. `dart:` and third-party
+`package:` targets produce no edge rather than an invented one.
 
 ### Configuration formats
 
@@ -276,8 +303,9 @@ to check.
   no call exists.
 - **Coverage is best-effort.** `check_index_coverage` tells you what was indexed and what was
   skipped and why. It does not prove a file was fully understood. The skipped sample shows one
-  representative per directory and reason, with a count of what it stands for, so a folder of
-  twenty icons cannot crowd out every other reason a file was left out.
+  representative per directory and reason, largest group first, with a count of what it stands for,
+  so a folder of twenty icons cannot crowd out every other reason a file was left out and the
+  biggest gap cannot fall off the end of the list.
 - **Linux x86_64 only.** macOS and Windows are not built or tested; CI covers Linux alone rather
   than listing platforms it does not verify.
 

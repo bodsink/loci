@@ -872,6 +872,7 @@ fn normalise_import_target(target: &str) -> String {
         .trim_end_matches(".jsx")
         .trim_end_matches(".tsx")
         .trim_end_matches(".ts")
+        .trim_end_matches(".dart")
         .trim_end_matches(".sh")
         .trim_end_matches(".mk")
         .trim_end_matches(".cmake")

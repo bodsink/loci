@@ -56,6 +56,7 @@ pub fn spec_for(language: LanguageId) -> Option<&'static LanguageSpec> {
         LanguageId::Make => &MAKE,
         LanguageId::Cmake => &CMAKE,
         LanguageId::Html => &HTML,
+        LanguageId::Dart => &DART,
     })
 }
 
@@ -534,6 +535,57 @@ static HTML: LanguageSpec = LanguageSpec {
     routes: "",
     method_parents: &[],
     scope_kinds: &[],
+};
+
+/// Dart names a method the same way it names a top-level function — both are
+/// a `function_signature` — so the two are told apart by where they sit, which
+/// is what `method_parents` is for. Getters are included because in Dart they
+/// are how a type exposes a computed value, and leaving them out would lose
+/// most of what a model class offers.
+///
+/// A mixin is a `Trait`: it contributes behaviour to types that take it on,
+/// which is the label's meaning here. An extension is a `Class` because it is
+/// a named container of methods, and nothing closer exists.
+static DART: LanguageSpec = LanguageSpec {
+    definitions: r#"
+(class_declaration name: (identifier) @name) @def.class
+(mixin_declaration name: (identifier) @name) @def.trait
+(extension_declaration name: (identifier) @name) @def.class
+(enum_declaration name: (identifier) @name) @def.enum
+(enum_constant name: (identifier) @name) @def.field
+(type_alias (type_identifier) @name) @def.type
+(function_declaration (function_signature name: (identifier) @name)) @def.function
+(method_declaration (method_signature (function_signature name: (identifier) @name))) @def.function
+(method_declaration (method_signature (getter_signature name: (identifier) @name))) @def.function
+(method_declaration (method_signature (setter_signature name: (identifier) @name))) @def.function
+(class_member
+  (declaration (initialized_identifier_list (initialized_identifier name: (identifier) @name)))) @def.field
+"#,
+    references: r#"
+(call_expression function: (identifier) @call.name) @call
+(call_expression
+  function: (member_expression
+    object: (_) @call.receiver
+    property: (identifier) @call.name)) @call
+(library_import (import_specification uri: (configurable_uri (uri) @import.name))) @import
+(library_export uri: (configurable_uri (uri) @import.name)) @import
+(class_declaration
+  name: (identifier) @subtype
+  superclass: (superclass type: (type (type_identifier) @extends)))
+(class_declaration
+  name: (identifier) @subtype
+  interfaces: (interfaces (type (type_identifier) @implements)))
+(class_declaration
+  name: (identifier) @subtype
+  superclass: (superclass (mixins (type (type_identifier) @implements))))
+"#,
+    routes: "",
+    method_parents: &["class_body", "extension_body"],
+    scope_kinds: &[
+        "class_declaration",
+        "mixin_declaration",
+        "extension_declaration",
+    ],
 };
 
 #[cfg(test)]

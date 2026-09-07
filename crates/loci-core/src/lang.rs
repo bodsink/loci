@@ -33,6 +33,8 @@ pub enum LanguageId {
     Cmake,
     /// Markup. Structure and the assets it pulls in, not behaviour.
     Html,
+    /// Application code, with no server in the Hybrid LSP scope.
+    Dart,
 }
 
 impl LanguageId {
@@ -58,6 +60,7 @@ impl LanguageId {
             Self::Make => "make",
             Self::Cmake => "cmake",
             Self::Html => "html",
+            Self::Dart => "dart",
         }
     }
 
@@ -83,6 +86,7 @@ impl LanguageId {
             "make" => Self::Make,
             "cmake" => Self::Cmake,
             "html" => Self::Html,
+            "dart" => Self::Dart,
             _ => return None,
         })
     }
@@ -101,6 +105,7 @@ impl LanguageId {
                 | Self::Make
                 | Self::Cmake
                 | Self::Html
+                | Self::Dart
         )
     }
 
@@ -133,6 +138,7 @@ impl LanguageId {
             "mk" | "mak" => Self::Make,
             "cmake" => Self::Cmake,
             "html" | "htm" => Self::Html,
+            "dart" => Self::Dart,
             _ => return None,
         })
     }

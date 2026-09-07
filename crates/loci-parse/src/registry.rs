@@ -93,6 +93,10 @@ pub const BUNDLED: &[BundledGrammar] = &[
         language: LanguageId::Html,
         grammar_crate: "tree-sitter-html",
     },
+    BundledGrammar {
+        language: LanguageId::Dart,
+        grammar_crate: "tree-sitter-dart",
+    },
 ];
 
 pub fn is_bundled(language: LanguageId) -> bool {
@@ -128,6 +132,7 @@ pub fn grammar(language: LanguageId) -> Option<Language> {
         LanguageId::Make => Language::new(tree_sitter_make::LANGUAGE),
         LanguageId::Cmake => Language::new(tree_sitter_cmake::LANGUAGE),
         LanguageId::Html => Language::new(tree_sitter_html::LANGUAGE),
+        LanguageId::Dart => Language::new(tree_sitter_dart::LANGUAGE),
     })
 }
 
