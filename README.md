@@ -198,6 +198,37 @@ lowers the error count.
 On a 94-file Qt codebase these passes took the files reported as `parse_partial` from 59 to 0, with
 no change in node count.
 
+### TypeScript and JSX
+
+Two places in the bundled grammar let a keyword win over an identifier, and each one truncates the
+file from that point on.
+
+The first is `&` in JSX. The lexer reads it as the start of a character reference and fails when no
+`;` closes it, so `accounting & session control` breaks an element while `&amp;` is fine. The second
+is an interface member whose name begins with `in` or `instanceof`, when members are separated by
+newlines rather than semicolons: `in` is taken as the operator continuing the type on the line
+above, the interface closes early, and its remaining members become top-level labelled statements.
+Only those two keywords do this, out of twenty-seven tried.
+
+Both are repaired the same way as the C++ passes, and only after a direct parse has already failed:
+a `&` in markup becomes a space, and two bytes of a member's indentation become `; `. Line counts,
+columns and byte lengths are unchanged, and the second pass writes over whitespace only, so no name
+the graph records can be altered.
+
+Which bytes to touch is read from the parse tree rather than matched in the text, because the same
+characters are ordinary code elsewhere. A text-level pass was measured first and it corrupted type
+intersections (`A & B`) and put semicolons into object literals that were already correct — and
+because the total error count still fell, the guard above would have accepted the damage. What
+matters is the *nearest* enclosing node, not overlapping spans: an element written inside
+`{cond ? (...) : null}` sits within an expression while still being markup itself.
+
+On a 4269-file Go and React project these passes took `parse_partial` from 33 files to 4, again with
+no change in node count. What they buy is not more symbols but honest ones: a truncated interface
+was still recorded, ending at the member the parse died on, so `get_code_snippet` returned half a
+type. The four that remain are a `Makefile` with a target named `export`, and three files using
+`import('...').T[]` inside a type argument — the same class of grammar fault, left alone rather than
+guessed at.
+
 ## Honest limits
 
 These are stated because an agent that trusts a wrong answer is worse than one that knows it needs

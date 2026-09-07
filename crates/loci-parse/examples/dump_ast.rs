@@ -11,15 +11,26 @@ fn main() {
     let language = args.next().expect("language id");
     let language = LanguageId::from_str_id(&language).expect("known language");
 
-    // `--qt` runs the source through the same Qt keyword neutraliser the
-    // indexer uses, so what is dumped is what the indexer actually parsed.
-    let neutralise = args.next().as_deref() == Some("--qt");
+    // `--rewrite` runs the source through the same dialect passes the indexer
+    // uses, so what is dumped is what the indexer actually parsed. Without it a
+    // dump can look broken in a way the indexer never sees.
+    let rewrite = matches!(args.next().as_deref(), Some("--rewrite" | "--qt"));
 
     let mut source = String::new();
     std::io::stdin().read_to_string(&mut source).expect("stdin");
-    if neutralise {
-        if let Some(rewritten) = loci_parse::prepare_cpp(&source) {
-            source = rewritten;
+    if rewrite {
+        // Applied in turn, each on the output of the last, because a file can
+        // need more than one of them.
+        let passes: [fn(LanguageId, &str) -> Option<String>; 4] = [
+            |_, s| loci_parse::prepare_cpp(s),
+            |_, s| loci_parse::flatten_conditionals(s),
+            loci_parse::neutralise_jsx_ampersands,
+            loci_parse::separate_keyword_members,
+        ];
+        for pass in passes {
+            if let Some(rewritten) = pass(language, &source) {
+                source = rewritten;
+            }
         }
     }
 

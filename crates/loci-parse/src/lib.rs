@@ -9,7 +9,9 @@ pub mod extract;
 pub mod registry;
 pub mod spec;
 
-pub use dialect::{flatten_conditionals, prepare_cpp};
+pub use dialect::{
+    flatten_conditionals, neutralise_jsx_ampersands, prepare_cpp, separate_keyword_members,
+};
 
 pub use extract::{
     extract, module_prefix, CallSite, Definition, ExtractedFile, ImportRef, RouteDef, TypeRel,

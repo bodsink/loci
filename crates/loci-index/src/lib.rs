@@ -203,7 +203,33 @@ fn extract_best_effort(
         }
     }
 
+    // TypeScript has two places where the lexer takes a keyword over an
+    // identifier. They are independent, and a file can need both, so the
+    // second pass builds on whatever the first produced.
+    let settled = best.0;
+    if !best.1.error_ranges.is_empty() && is_typescript_family(settled) {
+        let markup = loci_parse::neutralise_jsx_ampersands(settled, source);
+        if let Some(markup) = &markup {
+            best = better_of(best, settled, path, markup);
+        }
+        if !best.1.error_ranges.is_empty() {
+            let base = markup.as_deref().unwrap_or(source);
+            if let Some(separated) = loci_parse::separate_keyword_members(settled, base) {
+                best = better_of(best, settled, path, &separated);
+            }
+        }
+    }
+
     Ok(best)
+}
+
+/// Languages that share the tree-sitter-typescript lexer, and so its two
+/// keyword-over-identifier faults. JSX lives in the JavaScript grammars too.
+fn is_typescript_family(language: LanguageId) -> bool {
+    matches!(
+        language,
+        LanguageId::TypeScript | LanguageId::Tsx | LanguageId::JavaScript | LanguageId::Jsx
+    )
 }
 
 /// Keep `candidate` only if it parses `text` with fewer errors than `best`.

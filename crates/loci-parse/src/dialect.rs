@@ -1,22 +1,32 @@
-//! Making C++ sources parseable by a grammar that does not cover them.
+//! Making sources parseable by grammars that do not quite cover them.
 //!
-//! Two gaps cost real symbols on real repositories:
+//! Four gaps cost real symbols on real repositories:
 //!
 //! 1. tree-sitter-cpp implements C++, not Qt. Qt's moc keywords — `Q_OBJECT`,
 //!    `signals:`, `emit` — are macros that never reach a standards compliant
 //!    parser, so a Qt codebase parses as a field of syntax errors.
 //! 2. The grammar rejects `= {}` as a default argument, which is ordinary
 //!    C++11. One project here used it 42 times across 10 files.
+//! 3. A preprocessor conditional can choose part of one declaration, which no
+//!    grammar can represent because neither branch is a construct on its own.
+//! 4. tree-sitter-typescript lets a keyword win over an identifier in two
+//!    places, and both truncate the file: a `&` in JSX that is not a character
+//!    reference, and an interface member whose name begins with `in` or
+//!    `instanceof` when the members are separated by newlines alone.
 //!
-//! Both are handled by rewriting the source in place, preserving byte length
+//! All are handled by rewriting the source in place, preserving byte length
 //! exactly, so every offset, line and column the parser reports still points at
 //! the original file. Only structure is touched, never a name or a literal, and
-//! callers keep reading real source from disk. The indexer applies this only
+//! callers keep reading real source from disk. The indexer applies these only
 //! after a direct parse has already failed, and keeps the result only if it
 //! parses better, so a file the grammar already handles is never rewritten.
 //!
 //! Measured on a Qt project of 94 tracked C/C++ files: 52 files and 187 error
-//! nodes before, 21 files and 66 error nodes after the Qt pass alone.
+//! nodes before, 21 files and 66 error nodes after the Qt pass alone. On a
+//! 4269-file Go/React project, 32 TypeScript files parsed partially before the
+//! two TypeScript passes.
+
+use loci_core::LanguageId;
 
 /// Qt keywords that are safe to erase outright, and their replacement.
 ///
@@ -249,6 +259,203 @@ fn blank(buffer: &mut [u8], start: usize, end: usize) {
     for slot in buffer[start..end].iter_mut() {
         *slot = b' ';
     }
+}
+
+/// Nodes whose span is markup rather than code.
+///
+/// `jsx_expression` is deliberately absent and handled as its opposite: the
+/// `{...}` inside an element is ordinary TypeScript, where `&` really is the
+/// bitwise operator or a type intersection.
+const JSX_MARKUP: &[&str] = &[
+    "jsx_element",
+    "jsx_self_closing_element",
+    "jsx_opening_element",
+    "jsx_closing_element",
+    "jsx_fragment",
+    "jsx_attribute",
+];
+
+/// Blank each `&` in JSX markup that does not begin a character reference.
+///
+/// The JSX lexer reads `&` as the start of an entity and fails when no `;`
+/// closes it, so `Registered & Managed` and `url="a&b"` both truncate the file
+/// while `&amp;` is fine. The damage is not cosmetic: everything after the
+/// `&` leaves the element, so the component's own symbols can be lost.
+///
+/// Which `&` to touch is decided from the parse tree, not from the text. A
+/// regex would also hit `A & B` in a type intersection and `x & y` in an
+/// expression, corrupting real code; measured on 32 failing files, that
+/// approach made four of them worse. Reading the tree keeps every `&` outside
+/// markup untouched — including those inside `{...}`, which is why
+/// `jsx_expression` spans are subtracted rather than merely not added.
+///
+/// The replacement is a space because JSX text is content, never a symbol, so
+/// nothing the graph records can change.
+pub fn neutralise_jsx_ampersands(language: LanguageId, source: &str) -> Option<String> {
+    if !source.contains('&') {
+        return None;
+    }
+    let grammar = crate::registry::grammar(language)?;
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&grammar).ok()?;
+    let tree = parser.parse(source, None)?;
+
+    let root = tree.root_node();
+    let bytes = source.as_bytes();
+    let mut out = source.to_string();
+    // Safe because a space is one ASCII byte replacing one ASCII byte.
+    let buffer = unsafe { out.as_bytes_mut() };
+    let mut changed = false;
+
+    for (at, byte) in bytes.iter().enumerate() {
+        if *byte != b'&' || begins_character_reference(bytes, at) {
+            continue;
+        }
+        if in_markup(root, at) {
+            buffer[at] = b' ';
+            changed = true;
+        }
+    }
+
+    changed.then_some(out)
+}
+
+/// Whether the byte at `at` is markup rather than code.
+///
+/// Decided by the nearest enclosing JSX node, not by comparing spans: markup
+/// and expressions nest in both directions, and an element written inside
+/// `{cond ? (...) : null}` sits within a `jsx_expression` while still being
+/// markup itself. Subtracting whole expression spans would discard it, which
+/// on one project left fourteen files unrepaired.
+fn in_markup(root: tree_sitter::Node, at: usize) -> bool {
+    let mut node = root.descendant_for_byte_range(at, at + 1);
+    while let Some(current) = node {
+        if current.kind() == "jsx_expression" {
+            return false;
+        }
+        if JSX_MARKUP.contains(&current.kind()) {
+            return true;
+        }
+        node = current.parent();
+    }
+    false
+}
+
+/// Whether the `&` at `at` opens `&name;`, `&#48;` or `&#x30;`.
+fn begins_character_reference(bytes: &[u8], at: usize) -> bool {
+    let mut i = at + 1;
+    if bytes.get(i) == Some(&b'#') {
+        i += 1;
+        if matches!(bytes.get(i), Some(b'x' | b'X')) {
+            i += 1;
+        }
+    }
+    let start = i;
+    while bytes.get(i).is_some_and(u8::is_ascii_alphanumeric) {
+        i += 1;
+    }
+    i > start && bytes.get(i) == Some(&b';')
+}
+
+/// Keywords the lexer will claim from the start of an interface member name.
+///
+/// Found by trying twenty-seven keywords as a name prefix: only these two
+/// break, because only these two are binary operators that could continue the
+/// type on the line above.
+const SHADOWING_KEYWORDS: &[&str] = &["in", "instanceof"];
+
+/// Terminate the member above one whose name starts with a shadowing keyword.
+///
+/// TypeScript lets interface members be separated by newlines alone, and then
+/// `oper_status: number` followed by `in_octets: number` closes the interface
+/// early: the lexer takes `in` as the operator continuing `number`. Every
+/// member after that point leaves the interface and becomes a top-level
+/// labelled statement, so those fields never reach the graph at all.
+///
+/// An explicit `;` removes the ambiguity. It is written over the last two
+/// bytes of the line's indentation, so the file keeps its length, its line
+/// count, and the column of every name — and because only whitespace is
+/// overwritten, no symbol the graph records can be altered by this pass.
+/// Indentation of tabs, or of fewer than two spaces, is left alone rather than
+/// shifting anything.
+///
+/// An object literal is spelled the same way but forbids the semicolon, so the
+/// line's enclosing container is read from the tree first. Skipping that check
+/// turned three healthy literals into errors on one project, and the net count
+/// still fell, so the caller's guard would have accepted the damage.
+pub fn separate_keyword_members(language: LanguageId, source: &str) -> Option<String> {
+    let candidates: Vec<(usize, usize)> = {
+        let mut found = Vec::new();
+        let mut offset = 0usize;
+        for line in source.split_inclusive('\n') {
+            if let Some(indent) = shadowed_member_indent(line) {
+                found.push((offset, indent));
+            }
+            offset += line.len();
+        }
+        found
+    };
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let grammar = crate::registry::grammar(language)?;
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&grammar).ok()?;
+    let tree = parser.parse(source, None)?;
+    let root = tree.root_node();
+
+    let mut out = source.to_string();
+    // Safe because a semicolon is one ASCII byte replacing one space.
+    let buffer = unsafe { out.as_bytes_mut() };
+    let mut changed = false;
+
+    for (offset, indent) in candidates {
+        if takes_commas(root, offset + indent) {
+            continue;
+        }
+        buffer[offset + indent - 2] = b';';
+        changed = true;
+    }
+
+    changed.then_some(out)
+}
+
+/// Whether the member at `at` sits in a container whose entries are separated
+/// by commas, where a semicolon would be a syntax error.
+///
+/// Only the nearest enclosing container counts. An interface declared inside a
+/// method of an object literal is still an interface.
+fn takes_commas(root: tree_sitter::Node, at: usize) -> bool {
+    let mut node = root.descendant_for_byte_range(at, at + 1);
+    while let Some(current) = node {
+        match current.kind() {
+            "object" | "arguments" | "array" => return true,
+            "interface_body" | "object_type" | "statement_block" | "program" => return false,
+            _ => node = current.parent(),
+        }
+    }
+    false
+}
+
+/// Width of the indentation when a line declares a member whose name a keyword
+/// would claim, or `None` when the line is anything else.
+fn shadowed_member_indent(line: &str) -> Option<usize> {
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    if indent < 2 {
+        return None;
+    }
+    let rest = &line[indent..];
+    let name_end = rest.find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '$')?;
+    let name = &rest[..name_end];
+    if !SHADOWING_KEYWORDS.iter().any(|k| name.starts_with(k)) {
+        return None;
+    }
+    // A member is a name, an optional `?`, then `:`. Anything else on the line
+    // is some other construct that must not collect a semicolon.
+    let after = rest[name_end..].trim_start();
+    let after = after.strip_prefix('?').unwrap_or(after).trim_start();
+    after.starts_with(':').then_some(indent)
 }
 
 /// Offset of the `{` in an `= {}` starting at `equals`, if that is what follows.
@@ -634,5 +841,222 @@ void otherwise() {
     #[test]
     fn code_without_conditionals_is_not_rewritten() {
         assert_eq!(flatten_conditionals("int main() { return 0; }\n"), None);
+    }
+
+    fn tsx_errors(source: &str) -> usize {
+        crate::extract(LanguageId::Tsx, "c.tsx", source)
+            .expect("parse")
+            .error_ranges
+            .len()
+    }
+
+    fn ts_errors(source: &str) -> usize {
+        crate::extract(LanguageId::TypeScript, "m.ts", source)
+            .expect("parse")
+            .error_ranges
+            .len()
+    }
+
+    /// Taken from a component that read
+    /// `Broadband Remote Access Server — authentication, accounting & session
+    /// control`, where the lone `&` truncated the file.
+    #[test]
+    fn a_lone_ampersand_in_jsx_text_stops_breaking_the_parse() {
+        let source = "const A = () => <Tag color=\"ok\">Registered & Managed</Tag>\n";
+        assert!(tsx_errors(source) > 0, "the original must actually fail");
+
+        let rewritten = neutralise_jsx_ampersands(LanguageId::Tsx, source).expect("rewritten");
+
+        assert_eq!(rewritten.len(), source.len(), "offsets must not shift");
+        assert_eq!(tsx_errors(&rewritten), 0, "got {rewritten:?}");
+        assert!(
+            rewritten.contains("Registered") && rewritten.contains("Managed"),
+            "only the ampersand may change: {rewritten:?}"
+        );
+    }
+
+    /// An attribute holding a query string is the other half of the same
+    /// fault, and there the parser recovers with a MISSING node rather than an
+    /// ERROR, so looking only for ERROR nodes would miss it.
+    #[test]
+    fn an_ampersand_inside_a_jsx_attribute_is_handled_too() {
+        let source = "const A = () => <T url=\"https://m/vt?x={x}&y={y}\" />\n";
+        assert!(tsx_errors(source) > 0, "the original must actually fail");
+
+        let rewritten = neutralise_jsx_ampersands(LanguageId::Tsx, source).expect("rewritten");
+
+        assert_eq!(tsx_errors(&rewritten), 0, "got {rewritten:?}");
+    }
+
+    /// Markup and expressions nest both ways. Comparing whole spans instead of
+    /// asking for the nearest enclosing node left fourteen files unrepaired,
+    /// because their elements were written inside a conditional.
+    #[test]
+    fn an_element_written_inside_an_expression_is_still_markup() {
+        let source = "\
+export function P(p: { done: boolean }) {
+  return (
+    <Card>
+      {p.done ? (
+        <div>
+          {p.done ? <Check /> : <Circle />}
+          Customer & service selected
+        </div>
+      ) : null}
+    </Card>
+  )
+}
+";
+        assert!(tsx_errors(source) > 0, "the original must actually fail");
+
+        let rewritten = neutralise_jsx_ampersands(LanguageId::Tsx, source).expect("rewritten");
+
+        assert_eq!(tsx_errors(&rewritten), 0, "got {rewritten:?}");
+        assert!(
+            rewritten.contains("p.done ? <Check /> : <Circle />"),
+            "the expression beside it must be untouched: {rewritten:?}"
+        );
+    }
+
+    /// The whole reason for reading the tree. A text-level pass corrupts these
+    /// and, measured over the failing files, made four of them worse.
+    #[test]
+    fn an_ampersand_that_is_an_operator_is_never_touched() {
+        for source in [
+            "type Both = Left & Right\n",
+            "const mask = flags & 0xff\n",
+            "const A = () => <p>{left & right}</p>\n",
+            "const B = () => <p>{a && b ? 'y' : 'n'}</p>\n",
+        ] {
+            assert_eq!(
+                neutralise_jsx_ampersands(LanguageId::Tsx, source),
+                None,
+                "must leave operators alone: {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_valid_character_reference_is_left_as_written() {
+        for source in [
+            "const A = () => <p>a &amp; b</p>\n",
+            "const A = () => <p>a &#38; b</p>\n",
+            "const A = () => <p>a &#x26; b</p>\n",
+        ] {
+            assert_eq!(tsx_errors(source), 0, "precondition: {source:?}");
+            assert_eq!(neutralise_jsx_ampersands(LanguageId::Tsx, source), None);
+        }
+    }
+
+    /// Shaped after `frontend/src/types/index.ts`, where `in_rate` closed the
+    /// interface and every member below it left the graph.
+    const TRUNCATED_INTERFACE: &str = "\
+interface PortStats {
+  utilization: number
+  oper_status: number
+  in_octets: number
+  measured_at: string
+}
+";
+
+    fn separated(source: &str) -> Option<String> {
+        separate_keyword_members(LanguageId::TypeScript, source)
+    }
+
+    #[test]
+    fn an_interface_member_named_after_a_keyword_stops_truncating_the_file() {
+        assert!(
+            ts_errors(TRUNCATED_INTERFACE) > 0,
+            "the original must actually fail"
+        );
+
+        let rewritten = separated(TRUNCATED_INTERFACE).expect("rewritten");
+
+        assert_eq!(rewritten.len(), TRUNCATED_INTERFACE.len());
+        assert_eq!(
+            rewritten.lines().count(),
+            TRUNCATED_INTERFACE.lines().count(),
+            "line numbers must not shift"
+        );
+        assert_eq!(ts_errors(&rewritten), 0, "got {rewritten:?}");
+    }
+
+    /// What truncation actually costs. The interface's own symbol survives
+    /// either way, but it is recorded ending at the member the parse died on,
+    /// so `get_code_snippet` would hand back half a type.
+    #[test]
+    fn the_interface_regains_its_true_extent() {
+        let end_line = |source: &str| {
+            crate::extract(LanguageId::TypeScript, "s.ts", source)
+                .expect("parse")
+                .definitions
+                .iter()
+                .find(|d| d.name == "PortStats")
+                .expect("the interface itself is found either way")
+                .end_line
+        };
+
+        let truncated = end_line(TRUNCATED_INTERFACE);
+        let whole = end_line(&separated(TRUNCATED_INTERFACE).expect("rewritten"));
+
+        assert_eq!(
+            truncated, 3,
+            "the parse dies on the member above `in_octets`"
+        );
+        assert_eq!(whole, 6, "the rewrite must restore the closing brace");
+    }
+
+    /// Only whitespace may be overwritten, or a rescued member could arrive
+    /// under a mangled name.
+    /// The pass ran file-wide at first and put a semicolon into object
+    /// literals that were already correct. The net error count still fell, so
+    /// the indexer's guard would have kept the damage.
+    #[test]
+    fn an_object_literal_key_named_after_a_keyword_is_left_alone() {
+        let source = "\
+function f(s: Snapshot) {
+  return {
+    oper_status: s.oper_status,
+    in_rate: toBps(s.in_rate),
+    in_octets: 0,
+  }
+}
+";
+        assert_eq!(ts_errors(source), 0, "this literal is already correct");
+        assert_eq!(
+            separated(source),
+            None,
+            "a comma-separated container must not collect a semicolon"
+        );
+    }
+
+    #[test]
+    fn only_indentation_is_overwritten() {
+        let rewritten = separated(TRUNCATED_INTERFACE).expect("rewritten");
+        for (before, after) in TRUNCATED_INTERFACE.chars().zip(rewritten.chars()) {
+            if before != after {
+                assert_eq!(before, ' ', "a non-space byte was overwritten");
+                assert_eq!(after, ';');
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_members_and_shallow_indentation_are_left_alone() {
+        assert_eq!(
+            separated("interface A {\n  a: number\n  b: number\n}\n"),
+            None,
+            "nothing here is shadowed by a keyword"
+        );
+        assert_eq!(
+            separated("interface A {\n a: number\n in_b: number\n}\n"),
+            None,
+            "one space of indentation leaves no room for a semicolon"
+        );
+        assert_eq!(
+            separated("interface A {\n\tin_b: number\n}\n"),
+            None,
+            "a tab is one byte and cannot hold `; `"
+        );
     }
 }
