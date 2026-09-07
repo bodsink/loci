@@ -235,6 +235,42 @@ impl GraphWriter {
         Ok(())
     }
 
+    /// Remove nodes that no file owns, together with their edges.
+    ///
+    /// `remove_file` reaches nodes through the file that defined them. A Go
+    /// package node belongs to a directory instead, so it needs a way out of
+    /// the graph when that directory stops holding Go files.
+    pub fn remove_nodes(&self, node_ids: &[u64]) -> Result<()> {
+        if node_ids.is_empty() {
+            return Ok(());
+        }
+
+        for node_id in node_ids {
+            self.remove_node_edges(*node_id)?;
+        }
+
+        let mut nodes = self.tx.open_table(NODES).map_err(storage)?;
+        let mut qn = self.tx.open_multimap_table(QN_INDEX).map_err(storage)?;
+        let mut names = self.tx.open_multimap_table(NAME_INDEX).map_err(storage)?;
+        let mut files = self.tx.open_multimap_table(FILE_INDEX).map_err(storage)?;
+        for node_id in node_ids {
+            if let Some(raw) = nodes.remove(*node_id).map_err(storage)? {
+                let node: Node = serde_json::from_slice(raw.value()).map_err(storage)?;
+                qn.remove(node.qualified_name.as_str(), node.id)
+                    .map_err(storage)?;
+                names
+                    .remove(node.name.to_lowercase().as_str(), node.id)
+                    .map_err(storage)?;
+                if !node.file_path.is_empty() {
+                    files
+                        .remove(node.file_path.as_str(), node.id)
+                        .map_err(storage)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Drop every edge touching a node, from both adjacency directions.
     fn remove_node_edges(&self, node_id: u64) -> Result<()> {
         let mut edge_ids: Vec<u32> = Vec::new();

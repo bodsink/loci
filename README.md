@@ -99,6 +99,42 @@ Qualified names are dot-separated in every language: the module path from the fi
 enclosing definition, then the symbol. For example
 `services.orders-py.app.service.OrderService.create_order`.
 
+### Import resolution
+
+Source almost never spells an import the way the graph stores a file. TypeScript writes `@/types`,
+Dart writes `package:app/models/user.dart`, Go writes `github.com/you/svc/internal/domain`. Matching
+that text against file names resolves close to nothing, and the failure is silent: on the project
+this was measured against, `frontend/src/types/index.ts` was imported by 941 files and had an
+in-degree of **zero**. "Who uses this, what breaks if I change it" answered empty, which looks the
+same as "nothing uses this".
+
+So the indexer reads the manifests that define those spellings — `tsconfig.json` (or `jsconfig.json`)
+for path aliases, `pubspec.yaml` for the Dart package name, `go.mod` for the Go module path — and
+resolves an import to a repository path before looking it up. Relative imports are resolved against
+the importing file's own directory, an omitted extension is filled back in, and a directory import
+lands on its entry point (`index`, `mod`, `main`, `__init__`). A `tsconfig.json` is read as JSONC,
+because real ones carry comments and trailing commas, and its `extends` chain is followed for
+inherited mappings.
+
+An alias only applies inside the project whose manifest declares it, and a repository may hold
+several: the one measured here has four `go.mod` files, and an import lands in the module that
+declares it rather than whichever was read first. Targets outside the repository — `react`,
+`dart:async`, `fmt`, `github.com/gin-gonic/gin` — produce no edge at all.
+
+Go is the one language whose import names a package rather than a file, so it points at a `Package`
+node named by its import path. Pointing it at every file of the package instead was tried and
+measured: one package of 141 files with 456 importers produced 64,296 edges on its own, claiming a
+dependency on each file when the importer used a single type. A package node is the only node no
+file owns, so it is removed when its directory stops holding Go files.
+
+On that project the change added 16,378 import edges and 93 package nodes. `internal/domain` now has
+an in-degree of 456, matching its importer count in source exactly; `frontend/src/types/index.ts`
+has 971, being the 941 alias imports plus relative ones. Full-index edge building went from 2,414 ms
+to 2,576 ms, and an incremental run from 35 ms to 72 ms.
+
+Languages whose imports genuinely name a module rather than a path — Python, Rust, Java — keep
+resolving by dotted module name, which was already correct for them.
+
 ## Languages
 
 Twenty-one language IDs have a real tree-sitter grammar linked into the binary.
@@ -144,11 +180,10 @@ On the project this was measured against, 244 files parse with zero errors and
 contribute 5,869 nodes: 3,082 fields, 1,490 methods, 700 classes, 555 functions
 and 34 enums.
 
-Imports are the honest gap. Dart's own package is addressed as
-`package:goinfracloud/...`, and 974 of that project's imports are written that
-way; resolving them needs the package name from `pubspec.yaml`, which the
-indexer does not read yet. Path imports do resolve. `dart:` and third-party
-`package:` targets produce no edge rather than an invented one.
+Dart's own package is addressed as `package:goinfracloud/...`, which is resolved
+through the name in `pubspec.yaml` — see [Import resolution](#import-resolution).
+`dart:` and third-party `package:` targets produce no edge rather than an
+invented one.
 
 ### Configuration formats
 
@@ -301,6 +336,12 @@ to check.
 - **Unresolved calls are labelled, not hidden.** When a call site cannot be pinned to a definition,
   it becomes a `CALL_UNRESOLVED` edge with a reason. Absence of a `CALLS` edge is not evidence that
   no call exists.
+- **An unresolved import is silent, unlike an unresolved call.** An import that points outside the
+  repository, or that a manifest does not explain, produces no edge and no marker. That is right for
+  a third-party package, but it means a missing `IMPORTS` edge does not prove the dependency is
+  absent — only that nothing indexed matched it. Aliases declared somewhere other than
+  `tsconfig.json`, `jsconfig.json`, `pubspec.yaml` or `go.mod` (a bundler config, for instance) are
+  not read.
 - **Coverage is best-effort.** `check_index_coverage` tells you what was indexed and what was
   skipped and why. It does not prove a file was fully understood. The skipped sample shows one
   representative per directory and reason, largest group first, with a count of what it stands for,
@@ -401,7 +442,7 @@ routes and cross-file calls, used by both the tests and the benchmark.
 | `loci-core` | Errors, language IDs, sandboxed paths, data directories |
 | `loci-graph` | redb-backed store, schema, queries, coverage, catalog |
 | `loci-parse` | tree-sitter grammars and per-language extraction queries |
-| `loci-index` | Walking, hashing, symbol resolution, incremental indexing |
+| `loci-index` | Walking, hashing, symbol and import resolution, incremental indexing |
 | `loci-lsp` | Language server detection (resolution not yet implemented) |
 | `loci-mcp` | JSON-RPC over stdio, the 15 tools, usage journal |
 | `loci-cli` | The `loci` binary |

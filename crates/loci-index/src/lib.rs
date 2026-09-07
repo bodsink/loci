@@ -9,6 +9,7 @@
 
 pub mod changes;
 pub mod hybrid;
+pub mod imports;
 pub mod resolve;
 pub mod walk;
 
@@ -522,7 +523,17 @@ pub fn index_repository(root: &Path, options: &IndexOptions) -> Result<IndexRepo
             touched_names,
         }
     };
-    let resolved = rebuild_resolved_edges(&store, &mut next_edge_id, &mut phase_ms, &scope)?;
+    // Manifests are read once per run. They change how imports are spelled
+    // across the whole project, so a stale one would misroute every edge.
+    let resolver = imports::ImportResolver::discover(sandbox.root());
+    let resolved = rebuild_resolved_edges(
+        &store,
+        &mut next_node_id,
+        &mut next_edge_id,
+        &mut phase_ms,
+        &scope,
+        &resolver,
+    )?;
     let (mut node_count, mut edge_count, languages) =
         (resolved.nodes, resolved.edges, resolved.languages);
 
@@ -879,6 +890,214 @@ fn normalise_import_target(target: &str) -> String {
         .replace(['/', '\\'], ".")
 }
 
+/// Extensions an import may leave off, tried in this order.
+///
+/// A path spelled without a suffix is the norm in TypeScript and the bundlers
+/// around it, so the extension has to be guessed back. Declaration files come
+/// last: when both `x.ts` and `x.d.ts` exist the implementation is the file the
+/// importer depends on.
+const IMPLICIT_EXTENSIONS: &[&str] = &[
+    "ts", "tsx", "js", "jsx", "mjs", "cjs", "dart", "vue", "py", "go", "d.ts",
+];
+
+/// Bare names a directory import falls back to.
+const DIRECTORY_ENTRIES: &[&str] = &["index", "mod", "main", "__init__"];
+
+/// The spellings an import could use to name `path`, each with a rank.
+///
+/// This runs once per indexed file and answers the question from the file's
+/// side, which is the cheap direction: expanding every import into the ~35
+/// paths it might mean instead cost 2.8 seconds of edge building on a 4,500
+/// file project, against 35 milliseconds before.
+///
+/// Both the edge builder and the incremental affected-file analysis derive
+/// their matching from this one function. When those two disagreed about what
+/// an import resolves to, an incremental run silently dropped edges that a full
+/// run produced, and only a full reindex put them back.
+///
+/// Rank breaks ties when two files claim a spelling — `x.ts` and `x.tsx` both
+/// answer to `x` — so the winner does not depend on iteration order.
+fn path_spellings(path: &str) -> Vec<(u32, String)> {
+    let mut out = vec![(0, path.to_string())];
+
+    // Longest suffix first: `.d.ts` must not be read as `.ts`.
+    let stem = if let Some(stem) = path.strip_suffix(".d.ts") {
+        Some((IMPLICIT_EXTENSIONS.len() as u32, stem))
+    } else {
+        IMPLICIT_EXTENSIONS
+            .iter()
+            .enumerate()
+            .find_map(|(rank, extension)| {
+                path.strip_suffix(&format!(".{extension}"))
+                    .map(|stem| (rank as u32 + 1, stem))
+            })
+    };
+
+    if let Some((rank, stem)) = stem {
+        out.push((rank, stem.to_string()));
+
+        // A directory import loads the entry point inside it, so the directory
+        // is another name for this file.
+        let (parent, base) = match stem.rsplit_once('/') {
+            Some((parent, base)) => (parent, base),
+            None => ("", stem),
+        };
+        if let Some(entry) = DIRECTORY_ENTRIES.iter().position(|e| *e == base) {
+            if !parent.is_empty() {
+                out.push((100 + entry as u32 * 20 + rank, parent.to_string()));
+            }
+        }
+    }
+
+    out
+}
+
+/// Indexed files, keyed by every path an import could spell them with.
+struct PathIndex {
+    by_spelling: HashMap<String, (u32, u64)>,
+    /// Package node per Go package directory. A Go import names a package, so
+    /// it has no single file to point at.
+    go_packages: HashMap<String, u64>,
+}
+
+impl PathIndex {
+    fn build(nodes: &[Node], go_packages: HashMap<String, u64>) -> Self {
+        let mut by_spelling: HashMap<String, (u32, u64)> = HashMap::new();
+
+        for node in nodes.iter().filter(|n| n.label == NodeLabel::File) {
+            for (rank, spelling) in path_spellings(&node.file_path) {
+                by_spelling
+                    .entry(spelling)
+                    .and_modify(|held| {
+                        if rank < held.0 {
+                            *held = (rank, node.id);
+                        }
+                    })
+                    .or_insert((rank, node.id));
+            }
+        }
+
+        Self {
+            by_spelling,
+            go_packages,
+        }
+    }
+
+    fn get(&self, spelling: &str) -> Option<u64> {
+        self.by_spelling.get(spelling).map(|(_, node)| *node)
+    }
+}
+
+/// The node an import points at, or `None` when it leaves the index.
+///
+/// For most languages that is a file. A Go import is the exception: it names a
+/// package, so it points at the package node. Pointing it at every file of the
+/// package instead was measured on a real repository and rejected — one package
+/// of 141 files with 456 importers produced 64,296 edges on its own, claiming a
+/// dependency on each file when the importer used one type.
+///
+/// Manifest-driven resolution runs first because it is the precise answer. The
+/// dotted-module fallback stays for the languages whose imports genuinely name
+/// a module rather than a path — Python, Rust, Java — where the old matching
+/// was already right.
+fn resolve_import(
+    resolver: &imports::ImportResolver,
+    from_file: &str,
+    target: &str,
+    paths: &PathIndex,
+    by_module: &HashMap<String, u64>,
+) -> Option<u64> {
+    for candidate in resolver.candidates(from_file, target) {
+        if let Some(id) = paths.get(&candidate) {
+            return Some(id);
+        }
+        if let Some(&id) = paths.go_packages.get(&candidate) {
+            return Some(id);
+        }
+    }
+    by_module.get(&normalise_import_target(target)).copied()
+}
+
+/// Bring the Go package nodes in line with the Go files currently indexed.
+///
+/// These nodes are the only ones no file owns: a package is a directory, so
+/// `remove_file` can never reach them. They are kept, rather than derived on
+/// every run, because their ids have to stay valid for import edges written by
+/// files that this run did not touch.
+///
+/// Returns the package node per directory, and whether a package was created —
+/// which means files outside the current scope may now have somewhere to point.
+fn sync_go_packages(
+    writer: &loci_graph::GraphWriter,
+    nodes: &[Node],
+    resolver: &imports::ImportResolver,
+    next_node_id: &mut u64,
+) -> Result<(HashMap<String, u64>, bool)> {
+    let mut wanted: BTreeMap<String, String> = BTreeMap::new();
+    for node in nodes
+        .iter()
+        .filter(|n| n.label == NodeLabel::File && n.language == Some(LanguageId::Go))
+    {
+        let directory = match node.file_path.rsplit_once('/') {
+            Some((dir, _)) => dir.to_string(),
+            None => String::new(),
+        };
+        // A Go file outside every module has no import path, so nothing could
+        // ever refer to it by package.
+        if let Some(import_path) = resolver.go_import_path(&directory) {
+            wanted.insert(directory, import_path);
+        }
+    }
+
+    let existing: HashMap<String, u64> = nodes
+        .iter()
+        .filter(|n| n.label == NodeLabel::Package)
+        .map(|n| (n.file_path.clone(), n.id))
+        .collect();
+
+    let doomed: Vec<u64> = existing
+        .iter()
+        .filter(|(directory, _)| !wanted.contains_key(*directory))
+        .map(|(_, id)| *id)
+        .collect();
+    writer.remove_nodes(&doomed)?;
+
+    let mut packages = HashMap::new();
+    let mut created = false;
+    for (directory, import_path) in wanted {
+        let name = import_path
+            .rsplit('/')
+            .next()
+            .unwrap_or(&import_path)
+            .to_string();
+        let id = match existing.get(&directory) {
+            Some(&id) => id,
+            None => {
+                created = true;
+                let id = *next_node_id;
+                *next_node_id += 1;
+                id
+            }
+        };
+
+        let mut node = Node::new(
+            NodeLabel::Package,
+            name,
+            import_path,
+            directory.clone(),
+            1,
+            1,
+            Some(LanguageId::Go),
+        );
+        node.id = id;
+        node.source = Evidence::Ast;
+        writer.put_node(&node)?;
+        packages.insert(directory, id);
+    }
+
+    Ok((packages, created))
+}
+
 /// Which files' cross-file edges need rebuilding.
 enum EdgeScope {
     /// Rebuild the whole project. Used for a full index and whenever the
@@ -901,7 +1120,11 @@ impl EdgeScope {
     /// name whose definition moved, appeared or disappeared. Everything else
     /// keeps the edges it already has, because both its facts and the symbols
     /// it resolved against are untouched.
-    fn expand(&self, facts_by_file: &BTreeMap<String, FileFacts>) -> Option<Vec<String>> {
+    fn expand(
+        &self,
+        facts_by_file: &BTreeMap<String, FileFacts>,
+        resolver: &imports::ImportResolver,
+    ) -> Option<Vec<String>> {
         let (changed, touched_names) = match self {
             Self::Everything => return None,
             Self::Files {
@@ -912,6 +1135,35 @@ impl EdgeScope {
 
         let mut affected: std::collections::HashSet<&str> =
             changed.iter().map(String::as_str).collect();
+
+        // A file that imports a path which just appeared or vanished resolves
+        // differently now, even though no symbol name it mentions changed.
+        let mut changed_spellings: std::collections::HashSet<String> = changed
+            .iter()
+            .flat_map(|path| path_spellings(path))
+            .map(|(_, spelling)| spelling)
+            .collect();
+        // A Go import names the directory, so a changed Go file makes its whole
+        // package a changed target.
+        for path in changed.iter().filter(|p| p.ends_with(".go")) {
+            if let Some((directory, _)) = path.rsplit_once('/') {
+                changed_spellings.insert(directory.to_string());
+            }
+        }
+        for (path, facts) in facts_by_file {
+            if affected.contains(path.as_str()) {
+                continue;
+            }
+            let retargets = facts.imports.iter().any(|i| {
+                resolver
+                    .candidates(&i.from_file, &i.target)
+                    .iter()
+                    .any(|c| changed_spellings.contains(c))
+            });
+            if retargets {
+                affected.insert(path.as_str());
+            }
+        }
 
         if !touched_names.is_empty() {
             for (path, facts) in facts_by_file {
@@ -947,9 +1199,11 @@ impl EdgeScope {
 /// Rebuild the cross-file edges in `scope`.
 fn rebuild_resolved_edges(
     store: &GraphStore,
+    next_node_id: &mut u64,
     next_edge_id: &mut u32,
     phase_ms: &mut PhaseTimings,
     scope: &EdgeScope,
+    resolver: &imports::ImportResolver,
 ) -> Result<ResolvedEdges> {
     let phase_started = Instant::now();
     let (nodes, facts_by_file) = {
@@ -963,7 +1217,17 @@ fn rebuild_resolved_edges(
     phase_ms.load_facts = phase_started.elapsed().as_millis() as u64;
     let phase_started = Instant::now();
 
-    let affected = scope.expand(&facts_by_file);
+    let writer = store.write()?;
+    let (go_packages, package_created) = sync_go_packages(&writer, &nodes, resolver, next_node_id)?;
+
+    // A package that did not exist a moment ago is somewhere files outside this
+    // run's scope can now point, so their edges have to be reconsidered too.
+    let affected = if package_created {
+        None
+    } else {
+        scope.expand(&facts_by_file, resolver)
+    };
+
     let mut facts = FileFacts::default();
     match &affected {
         None => {
@@ -1005,6 +1269,7 @@ fn rebuild_resolved_edges(
         .filter(|n| n.label == NodeLabel::File)
         .map(|n| (n.qualified_name.clone(), n.id))
         .collect();
+    let path_index = PathIndex::build(&nodes, go_packages);
 
     const RESOLVED_TYPES: &[EdgeType] = &[
         EdgeType::Calls,
@@ -1015,7 +1280,6 @@ fn rebuild_resolved_edges(
         EdgeType::RoutesTo,
     ];
 
-    let writer = store.write()?;
     match &affected {
         None => {
             writer.clear_edges_of_type(RESOLVED_TYPES)?;
@@ -1041,8 +1305,13 @@ fn rebuild_resolved_edges(
         };
         // Only record an import when it lands on a file we actually indexed;
         // third-party targets are left out rather than invented.
-        let normalised = normalise_import_target(&import.target);
-        let Some(&dst) = file_node_by_module.get(normalised.as_str()) else {
+        let Some(dst) = resolve_import(
+            resolver,
+            &import.from_file,
+            &import.target,
+            &path_index,
+            &file_node_by_module,
+        ) else {
             continue;
         };
         if src == dst {
@@ -1110,7 +1379,10 @@ fn rebuild_resolved_edges(
     }
 
     Ok(ResolvedEdges {
-        nodes: nodes.len() as u64,
+        // Counted from the store, not from the snapshot read at the top of this
+        // function: package nodes are created in between, and reporting the
+        // snapshot understated the graph by exactly that many.
+        nodes: reader.node_count()?,
         edges: reader.edge_count()?,
         languages,
         unresolved_calls,
