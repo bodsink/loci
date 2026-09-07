@@ -68,6 +68,11 @@ pub struct RouteDef {
     pub method: String,
     pub path: String,
     pub handler_name: Option<String>,
+    /// Object a method handler hangs off, as written: the `h` of `h.Login`.
+    ///
+    /// Kept apart from the name so resolution can tell a method handler from a
+    /// free function, the same way it tells `svc.save()` from `save()`.
+    pub handler_receiver: Option<String>,
     pub line: u32,
     pub end_line: u32,
     pub framework_hint: String,
@@ -727,6 +732,8 @@ fn extract_routes(
         return Ok(());
     };
 
+    let prefixes = group_prefixes(root, source);
+
     let capture_names = query.capture_names();
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&query, root, source.as_bytes());
@@ -736,6 +743,7 @@ fn extract_routes(
         let mut path_node: Option<TsNode> = None;
         let mut handler_node: Option<TsNode> = None;
         let mut route_node: Option<TsNode> = None;
+        let mut router_node: Option<TsNode> = None;
 
         for capture in m.captures {
             match capture_names[capture.index as usize] {
@@ -745,6 +753,7 @@ fn extract_routes(
                     path_node.get_or_insert(capture.node);
                 }
                 "route.handler" => handler_node = Some(capture.node),
+                "route.router" => router_node = Some(capture.node),
                 "route" => route_node = Some(capture.node),
                 _ => {}
             }
@@ -768,18 +777,31 @@ fn extract_routes(
         }
 
         let path = unquote(text(path_node, source));
-        if !path.starts_with('/') {
-            // Route paths are literal URL paths; anything else is a false positive.
+        let prefix = router_node
+            .map(|node| text(node, source))
+            .and_then(|router| prefixes.get(router))
+            .map(String::as_str);
+
+        // Route paths are literal URL paths; anything else is a false positive.
+        // The exception is an empty path on a group, which is how a framework
+        // spells the group's own root — `customers.GET("", …)` is
+        // `/v1/customers`, not a stray string.
+        if !path.starts_with('/') && !(path.is_empty() && prefix.is_some()) {
             continue;
         }
+        let path = join_route(prefix, &path);
 
         let anchor = route_node.unwrap_or(method_node);
 
         // A registrar such as axum's `.route(path, get(handler))` carries the
         // verb on the wrapper call around the handler, not on the registrar.
-        let (handler_name, wrapped_verb) = match handler_node {
-            Some(node) => (Some(text(node, source).to_string()), None),
+        let (handler, wrapped_verb) = match handler_node {
+            Some(node) => (Some(handler_reference(node, source)), None),
             None => handler_from_arguments(source, path_node),
+        };
+        let (handler_name, handler_receiver) = match handler {
+            Some(reference) => (Some(reference.name), reference.receiver),
+            None => (None, None),
         };
 
         let method = match (is_verb, wrapped_verb.as_deref()) {
@@ -804,6 +826,7 @@ fn extract_routes(
             method,
             path,
             handler_name,
+            handler_receiver,
             line,
             end_line,
             framework_hint,
@@ -814,11 +837,183 @@ fn extract_routes(
     Ok(())
 }
 
+/// Path prefix each router variable in the file carries.
+///
+/// A service registers its routes on nested groups — `v1 := router.Group("/v1")`
+/// then `auth := v1.Group("/auth")` — and stores only the last segment against
+/// the route. Without the prefix, `/login` is what lands in the graph, and in
+/// one real project 760 routes collapsed onto 477 names with `/:id` repeated
+/// 116 times. Routes that cannot be told apart cannot answer anything.
+///
+/// Declarations are read in source order, so a group's own prefix is already
+/// known by the time a group nested inside it is read. A router built any other
+/// way simply has no prefix, which leaves the path exactly as it was before.
+fn group_prefixes(root: TsNode, source: &str) -> BTreeMap<String, String> {
+    let mut prefixes: BTreeMap<String, String> = BTreeMap::new();
+    let mut stack = vec![root];
+
+    // Pre-order, children left to right, which is source order for statements.
+    let mut ordered = Vec::new();
+    while let Some(node) = stack.pop() {
+        ordered.push(node);
+        let mut cursor = node.walk();
+        let children: Vec<TsNode> = node.named_children(&mut cursor).collect();
+        for child in children.into_iter().rev() {
+            stack.push(child);
+        }
+    }
+
+    for node in ordered {
+        if !matches!(
+            node.kind(),
+            "short_var_declaration" | "assignment_statement" | "variable_declaration"
+        ) {
+            continue;
+        }
+        let (Some(left), Some(right)) = (
+            node.child_by_field_name("left"),
+            node.child_by_field_name("right"),
+        ) else {
+            continue;
+        };
+
+        let Some(variable) = first_identifier(left, source) else {
+            continue;
+        };
+        let Some((parent, prefix)) = group_call(right, source) else {
+            continue;
+        };
+
+        let inherited = prefixes.get(&parent).map(String::as_str);
+        prefixes.insert(variable, join_route(inherited, &prefix));
+    }
+
+    prefixes
+}
+
+/// Read `parent.Group("/prefix")`, returning the parent and the literal prefix.
+fn group_call(node: TsNode, source: &str) -> Option<(String, String)> {
+    let call = find_call_expression(node)?;
+    let function = call.child_by_field_name("function")?;
+    if !matches!(
+        function.kind(),
+        "selector_expression" | "member_expression" | "field_expression"
+    ) {
+        return None;
+    }
+
+    let field = ["field", "property"]
+        .iter()
+        .find_map(|name| function.child_by_field_name(name))?;
+    if !spec::ROUTE_GROUPERS.contains(&text(field, source).to_lowercase().as_str()) {
+        return None;
+    }
+
+    let operand = ["operand", "object", "value"]
+        .iter()
+        .find_map(|name| function.child_by_field_name(name))?;
+    let arguments = call.child_by_field_name("arguments")?;
+    let mut cursor = arguments.walk();
+    // A group can be opened with an empty path and only middleware, which
+    // contributes nothing of its own but still inherits its parent.
+    let prefix = arguments
+        .named_children(&mut cursor)
+        .next()
+        .map(|first| unquote(text(first, source)))
+        .filter(|first| first.starts_with('/'))
+        .unwrap_or_default();
+
+    Some((text(operand, source).to_string(), prefix))
+}
+
+/// The call inside an expression list, or the node itself when it is one.
+fn find_call_expression(node: TsNode) -> Option<TsNode> {
+    if node.kind() == "call_expression" {
+        return Some(node);
+    }
+    let mut cursor = node.walk();
+    let children: Vec<TsNode> = node.named_children(&mut cursor).collect();
+    children.into_iter().find_map(find_call_expression)
+}
+
+/// Join a group prefix to a route path without doubling or dropping slashes.
+fn join_route(prefix: Option<&str>, path: &str) -> String {
+    let prefix = prefix.unwrap_or_default().trim_end_matches('/');
+    if prefix.is_empty() {
+        return path.to_string();
+    }
+    // A group's own root is the prefix itself, not the prefix with a trailing
+    // slash bolted on.
+    if path == "/" {
+        return prefix.to_string();
+    }
+    format!("{prefix}{path}")
+}
+
+/// A handler as the registration writes it.
+pub struct HandlerRef {
+    pub name: String,
+    pub receiver: Option<String>,
+}
+
+/// Read a handler expression, keeping the method apart from its receiver.
+///
+/// `handlers.Login` and `h.Login` both name `Login`. Taking the first
+/// identifier instead yields `handlers` or `h` — an object, which resolution
+/// then hunts for among functions and never finds. That single confusion left
+/// 758 routes in one project with no edge to the code that serves them.
+fn handler_reference(node: TsNode, source: &str) -> HandlerRef {
+    let selector = matches!(
+        node.kind(),
+        "selector_expression" | "member_expression" | "field_expression" | "attribute"
+    );
+
+    if selector {
+        // Grammars disagree on the field name, so try each and fall back to the
+        // last identifier, which is the method in all of these shapes.
+        let field = ["field", "property", "attribute"]
+            .iter()
+            .find_map(|name| node.child_by_field_name(name))
+            .or_else(|| last_identifier_node(node));
+        let object = node
+            .child_by_field_name("object")
+            .or_else(|| node.child_by_field_name("operand"))
+            .or_else(|| node.child_by_field_name("value"));
+
+        if let Some(field) = field {
+            return HandlerRef {
+                name: text(field, source).to_string(),
+                receiver: object.map(|o| text(o, source).to_string()),
+            };
+        }
+    }
+
+    HandlerRef {
+        name: first_identifier(node, source).unwrap_or_else(|| text(node, source).to_string()),
+        receiver: None,
+    }
+}
+
+/// Deepest-last identifier under a node, which is the member being selected.
+fn last_identifier_node(node: TsNode) -> Option<TsNode> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).last().and_then(|last| {
+        if matches!(
+            last.kind(),
+            "identifier" | "field_identifier" | "property_identifier"
+        ) {
+            Some(last)
+        } else {
+            last_identifier_node(last)
+        }
+    })
+}
+
 /// Find the handler passed alongside a route path.
 ///
-/// Returns the handler name and, when the handler is wrapped in a verb call
-/// such as axum's `get(handler)`, the verb that wrapper names.
-fn handler_from_arguments(source: &str, path_node: TsNode) -> (Option<String>, Option<String>) {
+/// Returns the handler and, when it is wrapped in a verb call such as axum's
+/// `get(handler)`, the verb that wrapper names.
+fn handler_from_arguments(source: &str, path_node: TsNode) -> (Option<HandlerRef>, Option<String>) {
     let Some(args) = path_node.parent() else {
         return (None, None);
     };
@@ -837,16 +1032,19 @@ fn handler_from_arguments(source: &str, path_node: TsNode) -> (Option<String>, O
         if let Some((verb, handler)) = verb_wrapped_handler(child, source) {
             return (Some(handler), Some(verb));
         }
-        if let Some(name) = first_identifier(child, source) {
-            return (Some(name), None);
+        // A closure is a handler with no name to link to; the route still
+        // stands on its own.
+        if child.kind().contains("func_literal") || child.kind().contains("closure") {
+            return (None, None);
         }
+        return (Some(handler_reference(child, source)), None);
     }
 
     (None, None)
 }
 
 /// Recognise `get(handler)` / `post(handler)` style wrappers.
-fn verb_wrapped_handler(node: TsNode, source: &str) -> Option<(String, String)> {
+fn verb_wrapped_handler(node: TsNode, source: &str) -> Option<(String, HandlerRef)> {
     if node.kind() != "call_expression" {
         return None;
     }
@@ -857,10 +1055,8 @@ fn verb_wrapped_handler(node: TsNode, source: &str) -> Option<(String, String)> 
     }
     let arguments = node.child_by_field_name("arguments")?;
     let mut cursor = arguments.walk();
-    let handler = arguments
-        .named_children(&mut cursor)
-        .find_map(|child| first_identifier(child, source))?;
-    Some((verb, handler))
+    let handler = arguments.named_children(&mut cursor).next()?;
+    Some((verb, handler_reference(handler, source)))
 }
 
 fn first_identifier(node: TsNode, source: &str) -> Option<String> {

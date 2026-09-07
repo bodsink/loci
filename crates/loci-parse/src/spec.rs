@@ -178,7 +178,9 @@ static GO: LanguageSpec = LanguageSpec {
 "#,
     routes: r#"
 (call_expression
-  function: (selector_expression field: (field_identifier) @route.method)
+  function: (selector_expression
+    operand: (_) @route.router
+    field: (field_identifier) @route.method)
   arguments: (argument_list (interpreted_string_literal) @route.path)) @route
 "#,
     method_parents: &[],
@@ -426,6 +428,14 @@ static PERL: LanguageSpec = LanguageSpec {
 pub const HTTP_VERBS: &[&str] = &[
     "get", "post", "put", "delete", "patch", "head", "options", "all",
 ];
+
+/// Calls that open a nested route group and contribute a path prefix.
+///
+/// Gin and Echo both spell it `Group`; Iris spells it `Party`. A route
+/// registered on the value one of these returns carries the prefix of every
+/// group above it, which is the difference between `/v1/auth/login` and a bare
+/// `/login` that 116 other routes also answer to.
+pub const ROUTE_GROUPERS: &[&str] = &["group", "party"];
 
 /// Framework-specific registration helpers that carry the verb elsewhere.
 pub const ROUTE_REGISTRARS: &[&str] = &["route", "handlefunc", "handle", "add_route"];

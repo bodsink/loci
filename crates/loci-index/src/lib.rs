@@ -787,6 +787,7 @@ fn write_file_symbols(
             route_links.push(StoredRouteLink {
                 route_qualified_name: route_qn,
                 handler_name: handler.clone(),
+                handler_receiver: route.handler_receiver.clone(),
                 file_path: outcome.relative_path.clone(),
             });
         }
@@ -1346,11 +1347,13 @@ fn rebuild_resolved_edges(
         let Some(src) = table.node_id_for_qualified_name(&link.route_qualified_name) else {
             continue;
         };
+        // A handler written `h.Login` is a method call in every respect but the
+        // parentheses, so it is resolved as one.
         let Some((dst, _)) = table.resolve_call(
             &link.handler_name,
             &link.file_path,
             &link.route_qualified_name,
-            resolve::CallShape::Bare,
+            resolve::CallShape::of(link.handler_receiver.as_deref()),
         ) else {
             continue;
         };

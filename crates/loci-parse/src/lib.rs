@@ -201,6 +201,49 @@ func run() {}
         assert_eq!(out.routes[0].handler_name.as_deref(), Some("healthHandler"));
     }
 
+    /// The shape a real Gin service registers routes in: nested groups holding
+    /// the prefix, and a handler that is a method on a receiver value.
+    ///
+    /// Both parts were wrong. The path stored `/login`, so 116 routes in one
+    /// project collapsed onto the single name `/:id`; and the handler read as
+    /// `authHandler`, the receiver variable, because the first identifier under
+    /// a selector expression is its object rather than its field.
+    #[test]
+    fn go_gin_groups_carry_their_prefix_and_method_handlers() {
+        let source = r#"
+package main
+
+func main() {
+	router := gin.Default()
+	v1 := router.Group("/v1")
+	{
+		auth := v1.Group("/auth")
+		auth.POST("/login", authHandler.Login)
+
+		customers := v1.Group("/customers")
+		customers.GET("/:id", customerHandler.GetByID)
+	}
+	router.GET("/health", healthCheck)
+}
+"#;
+        let out = extract(LanguageId::Go, "cmd/main.go", source).unwrap();
+
+        let paths: Vec<&str> = out.routes.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["/v1/auth/login", "/v1/customers/:id", "/health"]
+        );
+
+        let login = &out.routes[0];
+        assert_eq!(login.handler_name.as_deref(), Some("Login"));
+        assert_eq!(login.handler_receiver.as_deref(), Some("authHandler"));
+
+        // A plain function handler keeps working and has no receiver.
+        let health = &out.routes[2];
+        assert_eq!(health.handler_name.as_deref(), Some("healthCheck"));
+        assert_eq!(health.handler_receiver, None);
+    }
+
     #[test]
     fn rust_items_and_impl_methods() {
         let source = r#"

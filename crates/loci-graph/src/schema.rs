@@ -329,6 +329,10 @@ pub struct StoredTypeRel {
 pub struct StoredRouteLink {
     pub route_qualified_name: String,
     pub handler_name: String,
+    /// Object a method handler hangs off, so `h.Login` resolves as a method
+    /// rather than as a free function that does not exist.
+    #[serde(default)]
+    pub handler_receiver: Option<String>,
     pub file_path: String,
 }
 

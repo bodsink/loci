@@ -243,8 +243,30 @@ answer: all twenty files parse with zero errors. Be clear about the size of the 
 them added one node and two edges to a 35,107-node graph, because email templates expose no ids and
 link to nothing local. What it removed was twenty files' worth of `unsupported_language`.
 
-Route extraction currently recognises FastAPI, Express, net/http, axum, and ASP.NET attribute
-routes. Other frameworks produce no `Route` nodes rather than guessed ones.
+Route extraction currently recognises FastAPI, Express, net/http, Gin and Echo, axum, and ASP.NET
+attribute routes. Other frameworks produce no `Route` nodes rather than guessed ones.
+
+### HTTP routes
+
+A service registers most of its routes on nested groups — `v1 := router.Group("/v1")`, then
+`auth := v1.Group("/auth")`, then `auth.POST("/login", …)` — and only the last segment is written
+next to the route. Storing that segment alone made the route nodes useless: on the project measured
+here, none of 760 Go routes carried `/v1`, 360 were bare fragments, and `/:id` appeared 116 times as
+the same name. Routes that cannot be told apart cannot answer anything. Group prefixes are now
+tracked per file, in source order, so a route carries every prefix above it. A router built any
+other way has no prefix and its path is left exactly as written.
+
+The handler was wrong in a quieter way. For `authHandler.Login` the extractor took the first
+identifier under the expression, which is the object — `authHandler` — so resolution went looking
+for a function by that name and found none. It now reads the field as the name and keeps the object
+as a receiver, which is how ordinary method calls are already resolved. Together these took the
+project from 1 route with a handler edge to 494, and from 0 routes carrying `/v1` to 829.
+
+The remaining 355 Go routes are honest ambiguity rather than a bug. `zoneHandler.List` needs the
+type of `zoneHandler` to pick between the 72 methods named `List` in that repository, and 92 are
+named `Create`. The AST does not carry it, so no edge is written rather than a guessed one; `--lsp`
+is the mechanism for exactly this. A further 215 unlinked "routes" are the frontend's own
+`api.get('/customers')` calls, which are outbound requests with no local handler to point at.
 
 ### C, C++ and Qt
 
