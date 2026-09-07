@@ -3,6 +3,7 @@
 //! Exit codes: 0 on success, 1 on a handled loci error, 2 on bad usage.
 
 mod install;
+mod ui;
 
 use clap::{Parser, Subcommand};
 use loci_core::{LociError, Result};
@@ -96,6 +97,19 @@ enum Command {
 
     /// Run the MCP server over stdio. Cursor starts this; you rarely run it by hand.
     Mcp,
+
+    /// Serve the local web UI for inspecting indexed projects.
+    Ui {
+        /// Address to bind. Loopback only is the safe default.
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+        /// Port to listen on.
+        #[arg(long, default_value_t = 7420)]
+        port: u16,
+        /// Do not open a browser.
+        #[arg(long)]
+        no_open: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -138,6 +152,15 @@ fn run(cli: &Cli) -> Result<()> {
         Command::Changes { project, limit } => cmd_changes(project, *limit, cli.json),
         Command::Delete { project } => cmd_delete(project, cli.json),
         Command::Mcp => cmd_mcp(),
+        Command::Ui {
+            bind,
+            port,
+            no_open,
+        } => ui::run(&ui::ServeOptions {
+            bind: bind.clone(),
+            port: *port,
+            open_browser: !no_open,
+        }),
     }
 }
 

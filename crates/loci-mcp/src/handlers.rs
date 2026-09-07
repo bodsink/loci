@@ -38,7 +38,18 @@ fn required_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
 /// The sandbox is built from the recorded root, which may have been deleted
 /// since indexing; that surfaces as an explicit error rather than a panic.
 fn open(project: &str) -> Result<(GraphStore, Sandbox, String)> {
-    let (entry, store) = loci_index::open_project(project)?;
+    open_with(project, loci_index::open_project)
+}
+
+fn open_write(project: &str) -> Result<(GraphStore, Sandbox, String)> {
+    open_with(project, loci_index::open_project_write)
+}
+
+fn open_with(
+    project: &str,
+    open_store: fn(&str) -> Result<(loci_graph::ProjectEntry, GraphStore)>,
+) -> Result<(GraphStore, Sandbox, String)> {
+    let (entry, store) = open_store(project)?;
     let root = Path::new(&entry.root);
     let sandbox = Sandbox::new(root).map_err(|_| {
         LociError::InvalidArgument(format!(
@@ -750,7 +761,10 @@ pub fn search_code(args: &Value) -> Result<Value> {
 pub fn manage_adr(args: &Value) -> Result<Value> {
     let project = required_str(args, "project")?;
     let mode = args.get("mode").and_then(Value::as_str).unwrap_or("list");
-    let (store, _, _) = open(project)?;
+    let (store, _, _) = match mode {
+        "upsert" | "delete" => open_write(project)?,
+        _ => open(project)?,
+    };
 
     match mode {
         "list" => {
@@ -843,7 +857,7 @@ pub fn ingest_traces(args: &Value) -> Result<Value> {
         .and_then(Value::as_array)
         .ok_or_else(|| LociError::InvalidArgument("'traces' must be an array".to_string()))?;
 
-    let (store, _, _) = open(project)?;
+    let (store, _, _) = open_write(project)?;
 
     let mut linked = Vec::new();
     let mut unmatched = Vec::new();

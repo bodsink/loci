@@ -194,4 +194,42 @@ mod tests {
         assert_eq!(reader.nodes_by_name("persisted").unwrap().len(), 1);
         assert_eq!(reader.meta().unwrap().unwrap().name, "sample");
     }
+
+    #[test]
+    fn a_second_exclusive_open_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("graph.redb");
+        let _held = GraphStore::create(&path).unwrap();
+        let err = match GraphStore::open(&path) {
+            Ok(_) => panic!("a second exclusive open must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(err.code(), "storage_error");
+        assert!(
+            err.to_string().contains("locked for writing"),
+            "exclusive lock must be named, not the raw redb string: {err}"
+        );
+    }
+
+    #[test]
+    fn two_read_only_opens_can_run_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("graph.redb");
+        {
+            let store = GraphStore::create(&path).unwrap();
+            let writer = store.write().unwrap();
+            writer
+                .put_node(&function(1, "shared", "m.shared", "m.py", 1))
+                .unwrap();
+            writer
+                .put_meta(&ProjectMeta::new("sample".into(), "/tmp/sample".into()))
+                .unwrap();
+            writer.commit().unwrap();
+        }
+
+        let first = GraphStore::open_read(&path).unwrap();
+        let second = GraphStore::open_read(&path).unwrap();
+        assert_eq!(first.read().unwrap().node_count().unwrap(), 1);
+        assert_eq!(second.read().unwrap().node_count().unwrap(), 1);
+    }
 }

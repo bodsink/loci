@@ -7,9 +7,10 @@ agent can ask *"what calls this?"* instead of grepping and guessing.
 Everything runs on your machine. No cloud, no API key, no language runtime. Your source is read,
 parsed, and left where it is — only structure (names, paths, line ranges, relationships) is stored.
 
-**Status: milestone 1, plus the follow-up work.** Indexing, the graph, all 15 MCP tools, and the
-Cursor integration work today. Hybrid LSP is implemented and off by default; every edge records
-whether it came from the AST or from a language server. See [Honest limits](#honest-limits).
+**Status: milestone 1, plus the follow-up work.** Indexing, the graph, all 15 MCP tools, the
+Cursor integration, and a local web UI work today. Hybrid LSP is implemented and off by default;
+every edge records whether it came from the AST or from a language server. See
+[Honest limits](#honest-limits).
 
 ## Install
 
@@ -35,7 +36,11 @@ loci index /path/to/your/repo
 ```
 
 Ask the agent something structural — *"what calls `create_order`?"* — and it will reach for
-`list_projects` and `trace_path` on its own.
+`list_projects` and `trace_path` on its own. Or open the same graph in a browser:
+
+```bash
+loci ui
+```
 
 ## CLI
 
@@ -48,8 +53,27 @@ Ask the agent something structural — *"what calls `create_order`?"* — and it
 | `loci changes --project <id>` | Show which files changed since the last index run |
 | `loci delete <project>` | Delete a project's graph; the source repository is untouched |
 | `loci mcp` | Serve MCP over stdio (Cursor starts this for you) |
+| `loci ui` | Open a local web UI for the graph, per project |
 
 Add `--json` to any command for machine-readable output.
+
+## Web UI
+
+`loci ui` serves a page on loopback (`http://127.0.0.1:7420` by default) and opens it in the
+browser. `--bind`, `--port`, and `--no-open` are the only flags. Nothing is uploaded; the process
+reads the same catalog and graph files as `loci mcp`.
+
+From the page you can add a project (an absolute `repo_path`, optional name), switch between
+indexed projects, and:
+
+- walk a force-directed atlas (calls, imports, routes, or a symbol neighbourhood)
+- read the architecture counts, HTTP routes, and coverage
+- search symbols, open a snippet, and trace callers
+- invoke any of the 15 MCP tools with the same arguments the agent uses
+
+Reads take a shared lock on `graph.redb`, so the UI and Cursor's MCP server can inspect a
+project at the same time. An index run still takes an exclusive lock; if one is in progress the
+UI says so and you retry when it finishes.
 
 ## Where data lives
 
@@ -497,7 +521,7 @@ routes and cross-file calls, used by both the tests and the benchmark.
 | `loci-index` | Walking, hashing, symbol and import resolution, incremental indexing |
 | `loci-lsp` | Language server detection (resolution not yet implemented) |
 | `loci-mcp` | JSON-RPC over stdio, the 15 tools, usage journal |
-| `loci-cli` | The `loci` binary |
+| `loci-cli` | The `loci` binary, including `loci ui` and its embedded page |
 
 See [`docs/cursor-agent.md`](docs/cursor-agent.md) for how the tools are shaped around the way
 Cursor's agent actually behaves.

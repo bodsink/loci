@@ -4,8 +4,8 @@ use crate::schema::{
 };
 use loci_core::{LociError, Result};
 use redb::{
-    Database, MultimapTableDefinition, ReadableDatabase, ReadableMultimapTable, ReadableTable,
-    ReadableTableMetadata, TableDefinition,
+    Database, MultimapTableDefinition, ReadOnlyDatabase, ReadableDatabase, ReadableMultimapTable,
+    ReadableTable, ReadableTableMetadata, TableDefinition,
 };
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -31,12 +31,30 @@ fn storage<E: std::fmt::Display>(e: E) -> LociError {
     LociError::Storage(e.to_string())
 }
 
+fn open_failed<E: std::fmt::Display>(e: E) -> LociError {
+    let message = e.to_string();
+    if message.contains("already open") {
+        LociError::Storage(
+            "the graph is locked for writing by another loci process (usually an \
+             index run). Retry once that finishes."
+                .to_string(),
+        )
+    } else {
+        LociError::Storage(message)
+    }
+}
+
+enum StoreDb {
+    ReadWrite(Database),
+    ReadOnly(ReadOnlyDatabase),
+}
+
 /// A single project's persistent graph.
 ///
 /// One redb file holds nodes, edges, the lookup indexes that make symbol
 /// queries a B-tree seek rather than a scan, and the coverage records.
 pub struct GraphStore {
-    db: Database,
+    db: StoreDb,
 }
 
 impl GraphStore {
@@ -45,11 +63,15 @@ impl GraphStore {
             loci_core::paths::ensure_dir(parent)?;
         }
         let db = Database::create(path).map_err(storage)?;
-        let store = Self { db };
+        let store = Self {
+            db: StoreDb::ReadWrite(db),
+        };
         store.initialise_tables()?;
         Ok(store)
     }
 
+    /// Exclusive writer lock. A second writer, or a reader while this is held,
+    /// fails with a storage lock error.
     pub fn open(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Err(LociError::Storage(format!(
@@ -57,13 +79,31 @@ impl GraphStore {
                 path.display()
             )));
         }
-        let db = Database::open(path).map_err(storage)?;
-        Ok(Self { db })
+        let db = Database::open(path).map_err(open_failed)?;
+        Ok(Self {
+            db: StoreDb::ReadWrite(db),
+        })
+    }
+
+    /// Shared reader lock. The UI and MCP can both inspect a project while
+    /// nothing is indexing it. redb's exclusive `Database` lock is what made
+    /// two overlapping reads fail with "already open".
+    pub fn open_read(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Err(LociError::Storage(format!(
+                "no graph at {}",
+                path.display()
+            )));
+        }
+        let db = ReadOnlyDatabase::open(path).map_err(open_failed)?;
+        Ok(Self {
+            db: StoreDb::ReadOnly(db),
+        })
     }
 
     /// Creates every table so read transactions never fail on a fresh database.
     fn initialise_tables(&self) -> Result<()> {
-        let tx = self.db.begin_write().map_err(storage)?;
+        let tx = self.begin_write()?;
         {
             tx.open_table(NODES).map_err(storage)?;
             tx.open_table(EDGES).map_err(storage)?;
@@ -82,13 +122,26 @@ impl GraphStore {
         Ok(())
     }
 
+    fn begin_write(&self) -> Result<redb::WriteTransaction> {
+        match &self.db {
+            StoreDb::ReadWrite(db) => db.begin_write().map_err(storage),
+            StoreDb::ReadOnly(_) => Err(LociError::Storage(
+                "graph is open read-only; reopen it for writing".to_string(),
+            )),
+        }
+    }
+
     pub fn write(&self) -> Result<GraphWriter> {
-        let tx = self.db.begin_write().map_err(storage)?;
-        Ok(GraphWriter { tx })
+        Ok(GraphWriter {
+            tx: self.begin_write()?,
+        })
     }
 
     pub fn read(&self) -> Result<GraphReader> {
-        let tx = self.db.begin_read().map_err(storage)?;
+        let tx = match &self.db {
+            StoreDb::ReadWrite(db) => db.begin_read().map_err(storage)?,
+            StoreDb::ReadOnly(db) => db.begin_read().map_err(storage)?,
+        };
         Ok(GraphReader { tx })
     }
 }

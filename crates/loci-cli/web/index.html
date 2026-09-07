@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Loci</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <div class="orb orb-a"></div>
+  <div class="orb orb-b"></div>
+  <div class="grid"></div>
+
+  <aside class="rail">
+    <div class="brand">
+      <div class="mark" aria-hidden="true"></div>
+      <div>
+        <strong>Loci</strong>
+        <span>local graph</span>
+      </div>
+    </div>
+    <button class="add" id="add-project" type="button">Add project</button>
+    <div class="rail-label">Projects</div>
+    <nav class="projects" id="projects"></nav>
+  </aside>
+
+  <main class="stage">
+    <header class="top">
+      <div class="identity">
+        <h1 id="project-title">Select a project</h1>
+        <p id="project-root">Index a repository to see its graph.</p>
+      </div>
+      <div class="top-actions">
+        <label class="search">
+          <input id="global-search" type="search" placeholder="Find a symbol…" autocomplete="off">
+        </label>
+        <button class="ghost" id="reindex" type="button" hidden>Reindex</button>
+        <button class="ghost danger" id="delete-project" type="button" hidden>Delete graph</button>
+      </div>
+    </header>
+
+    <nav class="tabs" id="tabs">
+      <button type="button" data-tab="atlas" class="active">Atlas</button>
+      <button type="button" data-tab="overview">Overview</button>
+      <button type="button" data-tab="explore">Explore</button>
+      <button type="button" data-tab="tools">Tools</button>
+      <button type="button" data-tab="coverage">Coverage</button>
+    </nav>
+
+    <section class="workspace" id="workspace"></section>
+  </main>
+
+  <div class="modal" id="modal" hidden></div>
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -1451,14 +1451,30 @@ struct ResolvedEdges {
 }
 
 /// Open the graph for a project id, failing explicitly when it is missing.
+///
+/// Shared read lock: the UI and MCP can inspect the same project at once.
+/// Use [`open_project_write`] for ADR/trace writes; indexing opens the store
+/// exclusively itself.
 pub fn open_project(project_id: &str) -> Result<(ProjectEntry, GraphStore)> {
+    open_project_with(project_id, GraphStore::open_read)
+}
+
+/// Exclusive writer lock. Blocks readers until this handle is dropped.
+pub fn open_project_write(project_id: &str) -> Result<(ProjectEntry, GraphStore)> {
+    open_project_with(project_id, GraphStore::open)
+}
+
+fn open_project_with(
+    project_id: &str,
+    open: fn(&Path) -> Result<GraphStore>,
+) -> Result<(ProjectEntry, GraphStore)> {
     let catalog = Catalog::load()?;
     let entry = catalog.require(project_id)?.clone();
     let path = Path::new(&entry.store_path);
     if !path.exists() {
         return Err(LociError::IndexMissing(project_id.to_string()));
     }
-    let store = GraphStore::open(path)?;
+    let store = open(path)?;
     Ok((entry, store))
 }
 
