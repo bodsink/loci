@@ -19,6 +19,7 @@ edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/bodsink/loci"
+description = "Local-first code intelligence for AI coding agents"
 
 [workspace.dependencies]
 loci-core = { path = "crates/loci-core" }

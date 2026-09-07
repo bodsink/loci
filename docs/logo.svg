@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="Loci">
+  <defs>
+    <radialGradient id="shine" cx="30%" cy="30%" r="70%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="28%" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="wash" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#5eead4"/>
+      <stop offset="45%" stop-color="#a78bfa"/>
+      <stop offset="100%" stop-color="#f472b6"/>
+    </linearGradient>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="8" result="b"/>
+      <feMerge>
+        <feMergeNode in="b"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+  <rect width="256" height="256" rx="72" fill="#07070c"/>
+  <rect x="28" y="28" width="200" height="200" rx="56" fill="url(#wash)" filter="url(#glow)"/>
+  <rect x="28" y="28" width="200" height="200" rx="56" fill="url(#shine)"/>
+  <circle cx="86" cy="92" r="11" fill="#07070c"/>
+  <circle cx="168" cy="84" r="9" fill="#07070c"/>
+  <circle cx="178" cy="164" r="11" fill="#07070c"/>
+  <circle cx="96" cy="172" r="8" fill="#07070c"/>
+  <circle cx="128" cy="128" r="14" fill="#07070c"/>
+  <path d="M86 92 L128 128 L168 84 M128 128 L178 164 M128 128 L96 172" fill="none" stroke="#07070c" stroke-width="6" stroke-linecap="round"/>
+</svg>
