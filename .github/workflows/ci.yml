@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # Both names, so CI does not silently never run because the default branch
+    # is called something other than what this file guessed.
+    branches: [main, master]
   pull_request:
   workflow_dispatch:
 
@@ -64,11 +66,18 @@ jobs:
           mkdir -p "$FAKE_HOME/.cursor"
           echo '{"mcpServers":{"someone-else":{"command":"other","args":[]}}}' > "$FAKE_HOME/.cursor/mcp.json"
           HOME="$FAKE_HOME" ./target/release/loci install
-          python3 - "$FAKE_HOME/.cursor/mcp.json" <<'PY'
+          test -x "$FAKE_HOME/.local/bin/loci" \
+            || { echo "install did not leave a runnable binary on PATH" >&2; exit 1; }
+          python3 - "$FAKE_HOME/.cursor/mcp.json" "$FAKE_HOME" <<'PY'
           import json, sys
-          servers = json.load(open(sys.argv[1]))["mcpServers"]
+          config, home = sys.argv[1], sys.argv[2]
+          servers = json.load(open(config))["mcpServers"]
           assert "someone-else" in servers, "install clobbered an unrelated server"
           assert servers["loci"]["args"] == ["mcp"], servers["loci"]
+          expected = f"{home}/.local/bin/loci"
+          assert servers["loci"]["command"] == expected, (
+              f"config must point at the installed copy, not the build output: {servers['loci']}"
+          )
           print("install merged cleanly:", sorted(servers))
           PY
 
