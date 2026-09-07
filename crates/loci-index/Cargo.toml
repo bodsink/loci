@@ -1,0 +1,21 @@
+[package]
+name = "loci-index"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Repository walking, incremental indexing and graph construction for loci"
+
+[dependencies]
+loci-core = { workspace = true }
+loci-graph = { workspace = true }
+loci-parse = { workspace = true }
+loci-lsp = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+ignore = { workspace = true }
+rayon = { workspace = true }
+regex = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

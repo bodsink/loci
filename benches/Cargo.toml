@@ -1,0 +1,19 @@
+[package]
+name = "loci-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Measures loci index time and query latency. Reports what it observes."
+
+[[bin]]
+name = "loci-bench"
+path = "src/main.rs"
+
+[dependencies]
+loci-core = { workspace = true }
+loci-graph = { workspace = true }
+loci-index = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }

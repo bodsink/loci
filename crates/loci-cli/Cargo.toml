@@ -1,0 +1,25 @@
+[package]
+name = "loci-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The loci command line interface"
+
+[[bin]]
+name = "loci"
+path = "src/main.rs"
+
+[dependencies]
+loci-core = { workspace = true }
+loci-graph = { workspace = true }
+loci-index = { workspace = true }
+loci-parse = { workspace = true }
+loci-lsp = { workspace = true }
+loci-mcp = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

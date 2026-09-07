@@ -1,0 +1,16 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Local index stores accidentally created inside the repo
+/.loci/
+*.redb
+
+# Editor / OS
+.DS_Store
+*.swp
+
+# Local Cursor state (plans, rules, chat scratch) stays out of the repo.
+# .github is deliberately NOT ignored: the CI workflow has to be committed for
+# GitHub Actions to run it.
+.cursor
