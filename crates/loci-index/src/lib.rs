@@ -864,6 +864,14 @@ fn normalise_import_target(target: &str) -> String {
     target
         .trim_start_matches("./")
         .trim_end_matches(".js")
+        // Web extensions are written out in a `<script src>` and increasingly
+        // in ESM imports too, and a path that keeps its suffix resolves to
+        // nothing.
+        .trim_end_matches(".mjs")
+        .trim_end_matches(".cjs")
+        .trim_end_matches(".jsx")
+        .trim_end_matches(".tsx")
+        .trim_end_matches(".ts")
         .trim_end_matches(".sh")
         .trim_end_matches(".mk")
         .trim_end_matches(".cmake")

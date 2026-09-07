@@ -101,7 +101,7 @@ enclosing definition, then the symbol. For example
 
 ## Languages
 
-Nineteen language IDs have a real tree-sitter grammar linked into the binary.
+Twenty language IDs have a real tree-sitter grammar linked into the binary.
 
 Code: Python · JavaScript · JSX · TypeScript · TSX · Go · Rust · C · C++ · Java · C# · Kotlin ·
 Perl · Shell
@@ -110,9 +110,11 @@ Configuration: TOML · YAML · INI
 
 Build: Make · CMake
 
+Markup: HTML
+
 Every language named for Hybrid LSP is in that list, so no language the engine advertises can turn
-out to be unparseable. The reverse no longer holds: shell, configuration and build files are parsed
-but have no server in scope, and `hybrid_lsp_eligible` reports false for them.
+out to be unparseable. The reverse no longer holds: shell, configuration, build and markup files are
+parsed but have no server in scope, and `hybrid_lsp_eligible` reports false for them.
 `get_graph_schema` reports the list with the upstream crate behind each grammar so it can be
 audited. PHP is out of scope by design and CI fails if it reappears.
 
@@ -151,6 +153,33 @@ CMake contributes `function()` and `macro()` definitions, and every other comman
 call to a locally defined command resolves to it. `include()` and `add_subdirectory()` are imports
 instead — the latter resolved to that directory's `CMakeLists.txt`, since that is the file it
 actually pulls in. Both are matched without regard to case, as CMake itself does.
+
+### Markup
+
+HTML was the largest single group one real project reported as unsupported: nineteen files in a
+Go and React repository. What it contributes is narrow on purpose. An element carrying `id` becomes
+a `Field`, because that is the name the rest of the codebase addresses it by — `<div id="root">` is
+what the entry point mounts onto. A `src` or `href` on `script`, `link`, `img`, `iframe`, `source`
+or `embed` becomes an import, which is what makes `index.html` reach the module that boots the
+application. Everything else on a page is layout, and layout is not a question the graph answers.
+
+`<a href>` is deliberately not an import. A link is navigation, not a dependency, and on the project
+this was measured against all 144 of them held either an external URL or a `{{ }}` expression, so
+importing them would have added 144 edges to nodes that cannot exist. External URLs, protocol
+relative hosts, `mailto:`, `data:`, bare fragments and template expressions are all excluded for the
+same reason. A root-absolute path is resolved against the document's own directory, which is where
+the web root sits for the entry point that carries these links; that is the one convention assumed
+here.
+
+Attributes are read by walking rather than by query, for the reason CMake is: every attribute in
+this grammar is an `attribute` node holding an `attribute_name`, with nothing in the node type to
+separate `src` from `charset`.
+
+Seventeen of those nineteen files were Go templates rather than documents — `{{ }}` throughout, and
+in one case no `<html>` at all. The grammar reads template actions as text, which is the right
+answer: all twenty files parse with zero errors. Be clear about the size of the win, though. Indexing
+them added one node and two edges to a 35,107-node graph, because email templates expose no ids and
+link to nothing local. What it removed was twenty files' worth of `unsupported_language`.
 
 Route extraction currently recognises FastAPI, Express, net/http, axum, and ASP.NET attribute
 routes. Other frameworks produce no `Route` nodes rather than guessed ones.

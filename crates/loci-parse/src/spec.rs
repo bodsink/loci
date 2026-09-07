@@ -55,6 +55,7 @@ pub fn spec_for(language: LanguageId) -> Option<&'static LanguageSpec> {
         LanguageId::Ini => &INI,
         LanguageId::Make => &MAKE,
         LanguageId::Cmake => &CMAKE,
+        LanguageId::Html => &HTML,
     })
 }
 
@@ -515,6 +516,20 @@ static CMAKE: LanguageSpec = LanguageSpec {
 (function_def (function_command (argument_list . (argument) @name))) @def.function
 (macro_def (macro_command (argument_list . (argument) @name))) @def.function
 "#,
+    references: "",
+    routes: "",
+    method_parents: &[],
+    scope_kinds: &[],
+};
+
+/// Empty on purpose, and not for want of trying. Everything HTML contributes
+/// hangs off an attribute's *name*: `id` names an element, `src` names a file,
+/// `charset` names neither. This grammar spells all three as an `attribute`
+/// holding an `attribute_name`, so no pattern can tell them apart, and this
+/// query engine has no text predicates — the same wall CMake hits.
+/// `extract_html` walks instead.
+static HTML: LanguageSpec = LanguageSpec {
+    definitions: "",
     references: "",
     routes: "",
     method_parents: &[],

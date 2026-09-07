@@ -240,6 +240,9 @@ pub fn extract(language: LanguageId, relative_path: &str, source: &str) -> Resul
     if language == LanguageId::Cmake {
         extract_cmake_references(&mut extracted, root, source, relative_path);
     }
+    if language == LanguageId::Html {
+        extract_html(&mut extracted, root, source, relative_path, &prefix);
+    }
     extract_routes(&mut extracted, &grammar, spec, root, source, language)?;
 
     Ok(extracted)
@@ -483,6 +486,139 @@ fn extract_cmake_references(
             byte: identifier.start_byte(),
         });
     }
+}
+
+/// Tags whose `src` or `href` names a file the project ships.
+///
+/// `<a href>` is absent on purpose. A link is navigation, not a dependency,
+/// and in the templates this was measured on every one of the 144 of them held
+/// either an external URL or a `{{ }}` expression, so importing them would
+/// have added 144 edges to nodes that do not exist.
+const HTML_LINKING_TAGS: &[&str] = &["script", "link", "img", "iframe", "source", "embed"];
+
+/// What HTML contributes to the graph: the names a document exposes, and the
+/// files it pulls in.
+///
+/// Walked rather than queried for the reason CMake is. Every attribute in this
+/// grammar is an `attribute` holding an `attribute_name`, with nothing in the
+/// node type to separate `src` from `charset`, and this query engine has no
+/// text predicates.
+///
+/// An element carrying `id` is a definition because that is the name the rest
+/// of the codebase addresses it by — `<div id="root">` is what the entry point
+/// mounts onto. Ids are flat: HTML nesting is layout, not scope, and an id is
+/// unique across the whole document by definition.
+fn extract_html(
+    out: &mut ExtractedFile,
+    root: TsNode,
+    source: &str,
+    relative_path: &str,
+    prefix: &str,
+) {
+    let mut cursor = root.walk();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+        if !matches!(node.kind(), "start_tag" | "self_closing_tag") {
+            continue;
+        }
+        let Some(tag) = node.child(1).filter(|n| n.kind() == "tag_name") else {
+            continue;
+        };
+        let links = HTML_LINKING_TAGS.contains(&text(tag, source).to_ascii_lowercase().as_str());
+
+        let mut attributes = node.walk();
+        for attribute in node.children(&mut attributes) {
+            if attribute.kind() != "attribute" {
+                continue;
+            }
+            let Some(name) = attribute.child(0).filter(|n| n.kind() == "attribute_name") else {
+                continue;
+            };
+            let name = text(name, source).to_ascii_lowercase();
+            let Some(value) = html_attribute_value(attribute, source) else {
+                continue;
+            };
+
+            if name == "id" {
+                out.definitions.push(Definition {
+                    label: NodeLabel::Field,
+                    name: value.to_string(),
+                    // `index.html` names no module of its own, by the same rule
+                    // that makes `index.js` the package rather than a file in
+                    // it, so its ids are top-level names with nothing to
+                    // prefix.
+                    qualified_name: if prefix.is_empty() {
+                        value.to_string()
+                    } else {
+                        format!("{prefix}.{value}")
+                    },
+                    start_line: line_of(node),
+                    end_line: end_line_of(node),
+                    start_byte: node.start_byte(),
+                    end_byte: node.end_byte(),
+                    signature: None,
+                });
+            } else if links && matches!(name.as_str(), "src" | "href") {
+                if let Some(target) = shipped_asset(relative_path, value) {
+                    out.imports.push(ImportRef {
+                        target,
+                        line: line_of(attribute),
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn html_attribute_value<'a>(attribute: TsNode, source: &'a str) -> Option<&'a str> {
+    let mut cursor = attribute.walk();
+    let value = attribute.children(&mut cursor).find(|c| {
+        matches!(
+            c.kind(),
+            "quoted_attribute_value" | "attribute_value" | "unquoted_attribute_value"
+        )
+    })?;
+    if value.kind() != "quoted_attribute_value" {
+        return Some(text(value, source));
+    }
+    let mut inner = value.walk();
+    let inner = value
+        .children(&mut inner)
+        .find(|c| c.kind() == "attribute_value")?;
+    Some(text(inner, source))
+}
+
+/// The path a link points at, or `None` when it does not name a file in this
+/// project.
+///
+/// A root-absolute path is resolved against the document's own directory,
+/// which is where the web root sits for the entry point that carries these
+/// links. That is a convention, not a fact the source states, so it is the one
+/// guess here and it is confined to this function.
+fn shipped_asset(relative_path: &str, target: &str) -> Option<String> {
+    let target = target.trim();
+    // A template expression is not a path, and neither is an anchor, an
+    // external URL, a protocol-relative host, or inline data.
+    if target.is_empty()
+        || target.contains("{{")
+        || target.starts_with('#')
+        || target.starts_with("//")
+        || target.contains("://")
+        || target.split_once(':').is_some_and(|(s, _)| {
+            s.chars()
+                .all(|c| c.is_ascii_alphabetic() || matches!(c, '+' | '-' | '.'))
+        })
+    {
+        return None;
+    }
+    let target = target.split(['?', '#']).next()?;
+    Some(resolve_relative_target(
+        relative_path,
+        target.trim_start_matches('/'),
+    ))
 }
 
 fn first_cmake_argument(command: TsNode) -> Option<TsNode> {

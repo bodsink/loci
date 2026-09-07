@@ -31,6 +31,8 @@ pub enum LanguageId {
     /// name more often than by extension.
     Make,
     Cmake,
+    /// Markup. Structure and the assets it pulls in, not behaviour.
+    Html,
 }
 
 impl LanguageId {
@@ -55,6 +57,7 @@ impl LanguageId {
             Self::Ini => "ini",
             Self::Make => "make",
             Self::Cmake => "cmake",
+            Self::Html => "html",
         }
     }
 
@@ -79,6 +82,7 @@ impl LanguageId {
             "ini" => Self::Ini,
             "make" => Self::Make,
             "cmake" => Self::Cmake,
+            "html" => Self::Html,
             _ => return None,
         })
     }
@@ -90,7 +94,13 @@ impl LanguageId {
     pub const fn hybrid_lsp_eligible(self) -> bool {
         !matches!(
             self,
-            Self::Bash | Self::Toml | Self::Yaml | Self::Ini | Self::Make | Self::Cmake
+            Self::Bash
+                | Self::Toml
+                | Self::Yaml
+                | Self::Ini
+                | Self::Make
+                | Self::Cmake
+                | Self::Html
         )
     }
 
@@ -122,6 +132,7 @@ impl LanguageId {
             | "slice" => Self::Ini,
             "mk" | "mak" => Self::Make,
             "cmake" => Self::Cmake,
+            "html" | "htm" => Self::Html,
             _ => return None,
         })
     }
