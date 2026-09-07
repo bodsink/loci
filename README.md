@@ -63,6 +63,8 @@ Add `--json` to any command for machine-readable output.
 browser. `--bind`, `--port`, and `--no-open` are the only flags. Nothing is uploaded; the process
 reads the same catalog and graph files as `loci mcp`.
 
+![The Loci web UI showing the call atlas for this repository](docs/loci-ui.jpg)
+
 From the page you can add a project (an absolute `repo_path`, optional name), switch between
 indexed projects, and:
 
