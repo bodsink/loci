@@ -296,7 +296,13 @@ fn cmd_index(
     if !report.skipped_examples.is_empty() {
         println!("  skipped examples:");
         for example in &report.skipped_examples {
-            println!("    {} ({})", example.path, example.reason);
+            match example.others_like_it {
+                0 => println!("    {} ({})", example.path, example.reason),
+                n => println!(
+                    "    {} ({}, and {n} more like it here)",
+                    example.path, example.reason
+                ),
+            }
         }
     }
     println!();

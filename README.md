@@ -101,15 +101,17 @@ enclosing definition, then the symbol. For example
 
 ## Languages
 
-Seventeen language IDs have a real tree-sitter grammar linked into the binary.
+Nineteen language IDs have a real tree-sitter grammar linked into the binary.
 
 Code: Python · JavaScript · JSX · TypeScript · TSX · Go · Rust · C · C++ · Java · C# · Kotlin ·
 Perl · Shell
 
 Configuration: TOML · YAML · INI
 
+Build: Make · CMake
+
 Every language named for Hybrid LSP is in that list, so no language the engine advertises can turn
-out to be unparseable. The reverse no longer holds: shell and the configuration formats are parsed
+out to be unparseable. The reverse no longer holds: shell, configuration and build files are parsed
 but have no server in scope, and `hybrid_lsp_eligible` reports false for them.
 `get_graph_schema` reports the list with the upstream crate behind each grammar so it can be
 audited. PHP is out of scope by design and CI fails if it reappears.
@@ -134,6 +136,22 @@ Dotted directories are still pruned, with a short allowlist — `.github`, `.git
 because a CI workflow is tracked source that says how the project is built. `.git` and `.venv` stay
 out.
 
+### Build files
+
+`Makefile` has no extension and `CMakeLists.txt` has a useless one, so both are recognised by whole
+file name — `.txt` goes on meaning nothing. `.mk`, `.mak` and `.cmake` are matched by extension as
+usual.
+
+A make target is a named unit that other targets invoke by naming it as a prerequisite, so targets
+become `Function` nodes and prerequisites become call edges. That makes a Makefile a real dependency
+graph rather than a list of strings: `trace_path` answers "what breaks if this target changes".
+Variables become `Field` nodes and `include` becomes an import.
+
+CMake contributes `function()` and `macro()` definitions, and every other command as a call, so a
+call to a locally defined command resolves to it. `include()` and `add_subdirectory()` are imports
+instead — the latter resolved to that directory's `CMakeLists.txt`, since that is the file it
+actually pulls in. Both are matched without regard to case, as CMake itself does.
+
 Route extraction currently recognises FastAPI, Express, net/http, axum, and ASP.NET attribute
 routes. Other frameworks produce no `Route` nodes rather than guessed ones.
 
@@ -154,9 +172,31 @@ grammar already handles are never rewritten, and nothing on disk is touched.
 A side effect is fewer false edges: `Q_ARG` and friends were previously read as function calls, and
 they are macros, not functions.
 
-On a 94-file Qt codebase this took the files reported as `parse_partial` from 59 to 1. The one
-holdout is a preprocessor conditional splitting a single expression across `#ifdef` branches, which
-the grammar cannot represent; it stays reported rather than papered over.
+A preprocessor conditional is the last case, and the hardest, because it is chosen *inside* a
+declaration:
+
+```c
+const QStringList names =
+#ifdef Q_OS_WIN
+    {QStringLiteral("neighbor.exe")};
+#else
+    {QStringLiteral("neighbor")};
+#endif
+```
+
+Nothing there is a construct on its own, and the grammar reports the lost brace balance far away —
+in the file this came from, at a closing brace 117 lines below. So the conditional is resolved the
+way one compiler pass would: the first branch is kept, the directives and the branches not taken are
+erased. Keeping both branches instead was measured and is worse; it leaves a stray `{...};` behind
+and does not survive a conditional that splits a signature. `#if 0` is the one condition actually
+read, since it is the idiom for commenting out a block.
+
+The cost is that symbols reachable only through `#else` go unindexed in that file. It is bounded the
+same way as the rest: only files that already failed to parse are touched, and only when the rewrite
+lowers the error count.
+
+On a 94-file Qt codebase these passes took the files reported as `parse_partial` from 59 to 0, with
+no change in node count.
 
 ## Honest limits
 
@@ -175,7 +215,9 @@ to check.
   it becomes a `CALL_UNRESOLVED` edge with a reason. Absence of a `CALLS` edge is not evidence that
   no call exists.
 - **Coverage is best-effort.** `check_index_coverage` tells you what was indexed and what was
-  skipped and why. It does not prove a file was fully understood.
+  skipped and why. It does not prove a file was fully understood. The skipped sample shows one
+  representative per directory and reason, with a count of what it stands for, so a folder of
+  twenty icons cannot crowd out every other reason a file was left out.
 - **Linux x86_64 only.** macOS and Windows are not built or tested; CI covers Linux alone rather
   than listing platforms it does not verify.
 

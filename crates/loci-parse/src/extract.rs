@@ -237,6 +237,9 @@ pub fn extract(language: LanguageId, relative_path: &str, source: &str) -> Resul
     if language == LanguageId::Bash {
         extract_shell_references(&mut extracted, root, source, relative_path);
     }
+    if language == LanguageId::Cmake {
+        extract_cmake_references(&mut extracted, root, source, relative_path);
+    }
     extract_routes(&mut extracted, &grammar, spec, root, source, language)?;
 
     Ok(extracted)
@@ -344,15 +347,15 @@ fn extract_definitions(
     Ok(())
 }
 
-/// Turn a `source` argument into a repository-relative path.
+/// Turn an included path into a repository-relative one.
 ///
-/// A shell script sources relative to its own directory, while a File node is
-/// named from the repository root, so `source ./lib.sh` inside `scripts/build.sh`
-/// has to become `scripts/lib.sh` or the edge lands nowhere. Targets that
-/// escape the repository, or that interpolate a variable, are returned as
-/// written: they will simply fail to match, which is better than inventing a
-/// path.
-fn resolve_shell_target(relative_path: &str, target: &str) -> String {
+/// A shell script sources relative to its own directory, and a CMake file
+/// includes the same way, while a File node is named from the repository root.
+/// So `source ./lib.sh` inside `scripts/build.sh` has to become
+/// `scripts/lib.sh` or the edge lands nowhere. Targets that escape the
+/// repository, or that interpolate a variable, are returned as written: they
+/// will simply fail to match, which is better than inventing a path.
+fn resolve_relative_target(relative_path: &str, target: &str) -> String {
     if target.starts_with('/') || target.contains('$') {
         return target.to_string();
     }
@@ -403,7 +406,10 @@ fn extract_shell_references(
         if name == "source" || name == "." {
             if let Some(argument) = node.child_by_field_name("argument") {
                 out.imports.push(ImportRef {
-                    target: resolve_shell_target(relative_path, &unquote(text(argument, source))),
+                    target: resolve_relative_target(
+                        relative_path,
+                        &unquote(text(argument, source)),
+                    ),
                     line: line_of(argument),
                 });
             }
@@ -418,6 +424,77 @@ fn extract_shell_references(
             byte: name_node.start_byte(),
         });
     }
+}
+
+/// CMake commands, split into the two that pull in another file and the rest.
+///
+/// Every CMake command is a `normal_command`, so `include(other.cmake)` and
+/// `message(STATUS ...)` differ only in the identifier's text — the same
+/// problem shell has, and the same reason a query cannot solve it here.
+///
+/// `add_subdirectory(src)` names a directory, and the file it actually pulls
+/// in is that directory's `CMakeLists.txt`, so the target is spelled out
+/// before resolution or the edge would point at a directory that is not a
+/// node. Command names are matched without regard to case because CMake
+/// treats them that way and real projects shout them.
+fn extract_cmake_references(
+    out: &mut ExtractedFile,
+    root: TsNode,
+    source: &str,
+    relative_path: &str,
+) {
+    let mut cursor = root.walk();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+        if node.kind() != "normal_command" {
+            continue;
+        }
+        let Some(identifier) = node.child(0).filter(|n| n.kind() == "identifier") else {
+            continue;
+        };
+        let name = text(identifier, source);
+
+        let includes = name.eq_ignore_ascii_case("include");
+        let descends = name.eq_ignore_ascii_case("add_subdirectory");
+        if includes || descends {
+            if let Some(argument) = first_cmake_argument(node) {
+                let raw = unquote(text(argument, source));
+                let target = if descends {
+                    format!("{}/CMakeLists", raw.trim_end_matches('/'))
+                } else {
+                    raw
+                };
+                out.imports.push(ImportRef {
+                    target: resolve_relative_target(relative_path, &target),
+                    line: line_of(argument),
+                });
+            }
+            continue;
+        }
+
+        out.calls.push(CallSite {
+            callee_name: name.to_string(),
+            receiver: None,
+            line: line_of(identifier),
+            character: utf16_column(identifier, source),
+            byte: identifier.start_byte(),
+        });
+    }
+}
+
+fn first_cmake_argument(command: TsNode) -> Option<TsNode> {
+    let mut cursor = command.walk();
+    let arguments = command
+        .children(&mut cursor)
+        .find(|c| c.kind() == "argument_list")?;
+    let mut inner = arguments.walk();
+    let first = arguments
+        .children(&mut inner)
+        .find(|c| c.kind() == "argument");
+    first
 }
 
 fn extract_references(
@@ -698,16 +775,16 @@ pub fn label_histogram(extracted: &ExtractedFile) -> BTreeMap<&'static str, usiz
 
 #[cfg(test)]
 mod shell_target_tests {
-    use super::resolve_shell_target;
+    use super::resolve_relative_target;
 
     #[test]
     fn a_sibling_resolves_against_the_script_directory() {
         assert_eq!(
-            resolve_shell_target("scripts/build.sh", "./lib.sh"),
+            resolve_relative_target("scripts/build.sh", "./lib.sh"),
             "scripts/lib.sh"
         );
         assert_eq!(
-            resolve_shell_target("scripts/build.sh", "lib.sh"),
+            resolve_relative_target("scripts/build.sh", "lib.sh"),
             "scripts/lib.sh"
         );
     }
@@ -715,14 +792,14 @@ mod shell_target_tests {
     #[test]
     fn parent_segments_are_followed() {
         assert_eq!(
-            resolve_shell_target("packaging/deb/postinst", "../common/env.sh"),
+            resolve_relative_target("packaging/deb/postinst", "../common/env.sh"),
             "packaging/common/env.sh"
         );
     }
 
     #[test]
     fn a_script_at_the_root_keeps_a_bare_name() {
-        assert_eq!(resolve_shell_target("build.sh", "./lib.sh"), "lib.sh");
+        assert_eq!(resolve_relative_target("build.sh", "./lib.sh"), "lib.sh");
     }
 
     /// Nothing in the repository can match these, and guessing a path would be
@@ -730,15 +807,15 @@ mod shell_target_tests {
     #[test]
     fn targets_that_cannot_be_resolved_are_left_alone() {
         assert_eq!(
-            resolve_shell_target("scripts/build.sh", "/etc/profile"),
+            resolve_relative_target("scripts/build.sh", "/etc/profile"),
             "/etc/profile"
         );
         assert_eq!(
-            resolve_shell_target("scripts/build.sh", "$HOME/lib.sh"),
+            resolve_relative_target("scripts/build.sh", "$HOME/lib.sh"),
             "$HOME/lib.sh"
         );
         assert_eq!(
-            resolve_shell_target("build.sh", "../outside.sh"),
+            resolve_relative_target("build.sh", "../outside.sh"),
             "../outside.sh"
         );
     }

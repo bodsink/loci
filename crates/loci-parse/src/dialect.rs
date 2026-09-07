@@ -111,6 +111,146 @@ pub fn prepare_cpp(source: &str) -> Option<String> {
     changed.then_some(out)
 }
 
+/// Resolve `#if` / `#else` / `#endif` the way one compiler pass would: keep
+/// the first branch, erase the directives and the branches not taken.
+///
+/// A conditional usually parses fine, because each branch is a complete
+/// construct. The case that does not is a conditional chosen *inside* one
+/// declaration:
+///
+/// ```text
+/// const QStringList names =
+/// #ifdef Q_OS_WIN
+///     {QStringLiteral("sagara-neighbor.exe")};
+/// #else
+///     {QStringLiteral("sagara-neighbor")};
+/// #endif
+/// ```
+///
+/// Nothing here is a construct on its own: not the text before `#ifdef`, not
+/// either branch. The grammar loses brace balance and reports the damage far
+/// away — in the file this came from, at the closing brace of a function 117
+/// lines below.
+///
+/// Erasing only the directives and keeping both branches leaves a stray
+/// `{...};` behind, which on that file removed one parse error of three and
+/// left two. Keeping one branch is what a build actually compiles, and it
+/// survives the harder shape where the branches split a signature:
+/// `#ifdef WIN` / `void f() {` / `#else` / `void g() {` / `#endif`.
+///
+/// The cost is that symbols reachable only through `#else` go unindexed on
+/// this file. That is bounded: the caller reaches for this only after a plain
+/// parse has already failed, and keeps the result only if it lowers the error
+/// count, so a file the grammar already reads is never touched.
+///
+/// `#if 0` is the one condition read rather than assumed, because it is the
+/// idiom for commenting out a block; there the `#else` branch is the one a
+/// build sees.
+pub fn flatten_conditionals(source: &str) -> Option<String> {
+    let mut out = source.to_string();
+    // Safe because every byte written is a space, and only over ASCII.
+    let buffer = unsafe { out.as_bytes_mut() };
+    let mut changed = false;
+    let mut offset = 0usize;
+    let mut continuing = false;
+    let mut groups: Vec<Group> = Vec::new();
+
+    for line in source.split_inclusive('\n') {
+        let text = line.trim_end_matches(['\n', '\r']);
+        let (start, end) = (offset, offset + text.len());
+        offset += line.len();
+
+        if continuing {
+            blank(buffer, start, end);
+            changed = true;
+            continuing = text.ends_with('\\');
+            continue;
+        }
+
+        match directive(text) {
+            Some(Directive::Open { plausible }) => {
+                let outer = groups.last().is_none_or(|g| g.live);
+                groups.push(Group {
+                    outer,
+                    live: outer && plausible,
+                    taken: plausible,
+                });
+            }
+            Some(Directive::Switch { plausible }) => {
+                if let Some(group) = groups.last_mut() {
+                    let take = plausible && !group.taken;
+                    group.taken |= take;
+                    group.live = group.outer && take;
+                }
+            }
+            Some(Directive::Close) => {
+                groups.pop();
+            }
+            None => {
+                if groups.last().is_none_or(|g| g.live) {
+                    continue;
+                }
+            }
+        }
+
+        blank(buffer, start, end);
+        changed = true;
+        continuing = text.ends_with('\\');
+    }
+
+    changed.then_some(out)
+}
+
+/// One `#if` … `#endif` group while the scan is inside it.
+struct Group {
+    /// Whether the enclosing groups kept this one's territory at all.
+    outer: bool,
+    /// Whether the branch currently open is the one being kept.
+    live: bool,
+    /// Whether some branch of this group has already been kept, which is what
+    /// makes `#else` the alternative rather than a second helping.
+    taken: bool,
+}
+
+enum Directive {
+    /// `plausible` is false only for `#if 0`, the idiom for commenting out a
+    /// block. Keeping that branch would feed the graph code that never builds.
+    Open {
+        plausible: bool,
+    },
+    Switch {
+        plausible: bool,
+    },
+    Close,
+}
+
+/// Classify a line as a conditional directive, or `None` if it is not one.
+///
+/// `#define`, `#include` and `#pragma` are deliberately absent: they carry
+/// meaning the parser can already use, and erasing them would lose it.
+fn directive(line: &str) -> Option<Directive> {
+    // `#  ifdef` with space after the hash is legal and does occur.
+    let rest = line.trim_start().strip_prefix('#')?.trim_start();
+    let end = rest
+        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .unwrap_or(rest.len());
+    let (keyword, condition) = rest.split_at(end);
+    let plausible = condition.trim().trim_end_matches('\\').trim() != "0";
+    match keyword {
+        "if" | "ifdef" | "ifndef" => Some(Directive::Open { plausible }),
+        "elif" | "elifdef" | "elifndef" => Some(Directive::Switch { plausible }),
+        "else" => Some(Directive::Switch { plausible: true }),
+        "endif" => Some(Directive::Close),
+        _ => None,
+    }
+}
+
+fn blank(buffer: &mut [u8], start: usize, end: usize) {
+    for slot in buffer[start..end].iter_mut() {
+        *slot = b' ';
+    }
+}
+
 /// Offset of the `{` in an `= {}` starting at `equals`, if that is what follows.
 ///
 /// Deliberately narrow: only an empty brace pair, and not `==`, `>=` or any
@@ -337,5 +477,162 @@ mod tests {
     fn a_compound_operator_is_not_mistaken_for_an_initialiser() {
         assert_eq!(prepare_cpp("while (a >= {});\n"), None);
         assert_eq!(prepare_cpp("if (a != {});\n"), None);
+    }
+
+    /// Copied in shape from the one file that still parsed partially: the
+    /// initialiser of `names` lives inside the conditional, semicolon and all.
+    const SPLIT_DECLARATION: &str = "\
+void f() {
+    const QStringList names =
+#ifdef Q_OS_WIN
+        {QStringLiteral(\"a.exe\")};
+#else
+        {QStringLiteral(\"a\")};
+#endif
+}
+";
+
+    #[test]
+    fn a_conditional_that_splits_a_declaration_is_flattened() {
+        let flattened = flatten_conditionals(SPLIT_DECLARATION).expect("directives present");
+
+        assert_eq!(
+            flattened.len(),
+            SPLIT_DECLARATION.len(),
+            "offsets must not shift"
+        );
+        assert_eq!(
+            flattened.lines().count(),
+            SPLIT_DECLARATION.lines().count(),
+            "line numbers must not shift"
+        );
+        assert!(
+            !flattened.contains('#'),
+            "every directive line must be gone: {flattened:?}"
+        );
+        assert!(
+            flattened.contains("QStringList names") && flattened.contains("a.exe"),
+            "the branch a build would take must survive: {flattened:?}"
+        );
+        assert!(
+            !flattened.contains("QStringLiteral(\"a\")"),
+            "the branch not taken must be erased, not merged: {flattened:?}"
+        );
+    }
+
+    /// The shape that defeats merging: the branches split the signature, so
+    /// keeping both produces two openings and one closing brace.
+    #[test]
+    fn a_conditional_that_splits_a_signature_parses_after_resolution() {
+        let source = "\
+#ifdef Q_OS_WIN
+void windowsOnly() {
+#else
+void otherwise() {
+#endif
+    work();
+}
+";
+        let flattened = flatten_conditionals(source).expect("directives present");
+        let errors = crate::extract(loci_core::LanguageId::Cpp, "s.cpp", &flattened)
+            .expect("parse")
+            .error_ranges
+            .len();
+
+        assert_eq!(
+            errors, 0,
+            "resolution must leave a clean parse: {flattened:?}"
+        );
+        assert!(flattened.contains("windowsOnly"));
+    }
+
+    /// `#if 0` is how a block is commented out, so its body is not what a
+    /// build compiles and must not become graph symbols.
+    #[test]
+    fn a_disabled_block_yields_to_its_alternative() {
+        let flattened =
+            flatten_conditionals("#if 0\nvoid dead() {}\n#else\nvoid live() {}\n#endif\n")
+                .expect("directives present");
+
+        assert!(flattened.contains("live"), "got {flattened:?}");
+        assert!(
+            !flattened.contains("dead"),
+            "disabled code must not reach the graph: {flattened:?}"
+        );
+    }
+
+    /// An inner conditional inside a branch that was dropped must go with it,
+    /// rather than resurrecting its own first branch.
+    #[test]
+    fn a_nested_conditional_inside_a_dropped_branch_stays_dropped() {
+        let flattened = flatten_conditionals(
+            "#ifdef A\nvoid kept() {}\n#else\n#ifdef B\nvoid buried() {}\n#endif\n#endif\n",
+        )
+        .expect("directives present");
+
+        assert!(flattened.contains("kept"), "got {flattened:?}");
+        assert!(
+            !flattened.contains("buried"),
+            "nesting must not escape a dropped branch: {flattened:?}"
+        );
+    }
+
+    /// The whole point is that the grammar can read the result, so assert on
+    /// the parser rather than on the text alone.
+    #[test]
+    fn flattening_removes_the_parse_errors_the_conditional_caused() {
+        let before = crate::extract(loci_core::LanguageId::Cpp, "n.cpp", SPLIT_DECLARATION)
+            .expect("parse")
+            .error_ranges
+            .len();
+        assert!(before > 0, "the unflattened form must actually fail");
+
+        let flattened = flatten_conditionals(SPLIT_DECLARATION).expect("directives present");
+        let after = crate::extract(loci_core::LanguageId::Cpp, "n.cpp", &flattened)
+            .expect("parse")
+            .error_ranges
+            .len();
+
+        assert_eq!(after, 0, "flattening must leave a clean parse, had {after}");
+    }
+
+    /// Directives that carry meaning the parser uses must not be swept up
+    /// alongside the conditionals.
+    #[test]
+    fn includes_defines_and_pragmas_are_left_alone() {
+        assert_eq!(
+            flatten_conditionals("#include <QDir>\n#define N 4\n#pragma once\nint a = N;\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_hash_with_space_before_the_keyword_is_still_a_directive() {
+        let flattened = flatten_conditionals("#  ifdef X\nint a;\n#  endif\n").expect("directive");
+        assert!(!flattened.contains('#'), "got {flattened:?}");
+        assert!(flattened.contains("int a;"));
+    }
+
+    /// A condition spread over continuation lines has to be erased whole, or
+    /// the tail is left behind as stray tokens.
+    #[test]
+    fn a_continued_condition_is_erased_including_its_tail() {
+        let flattened =
+            flatten_conditionals("#if defined(A) || \\\n    defined(B)\nint a;\n#endif\n")
+                .expect("directive");
+
+        assert!(
+            !flattened.contains("defined"),
+            "the continuation must go too: {flattened:?}"
+        );
+        assert!(
+            flattened.contains("int a;"),
+            "the first branch is kept: {flattened:?}"
+        );
+    }
+
+    #[test]
+    fn code_without_conditionals_is_not_rewritten() {
+        assert_eq!(flatten_conditionals("int main() { return 0; }\n"), None);
     }
 }

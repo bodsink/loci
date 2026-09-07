@@ -53,6 +53,8 @@ pub fn spec_for(language: LanguageId) -> Option<&'static LanguageSpec> {
         LanguageId::Toml => &TOML,
         LanguageId::Yaml => &YAML,
         LanguageId::Ini => &INI,
+        LanguageId::Make => &MAKE,
+        LanguageId::Cmake => &CMAKE,
     })
 }
 
@@ -481,6 +483,42 @@ static INI: LanguageSpec = LanguageSpec {
     routes: "",
     method_parents: &[],
     scope_kinds: &["section"],
+};
+
+/// A make target is a named unit other targets invoke by naming it as a
+/// prerequisite, so targets are functions and prerequisites are calls. That
+/// turns a Makefile into a real dependency graph that `trace_path` can walk,
+/// rather than a list of strings. Variables are the file's fields.
+static MAKE: LanguageSpec = LanguageSpec {
+    definitions: r#"
+(rule (targets (word) @name)) @def.function
+(variable_assignment name: (word) @name) @def.field
+"#,
+    references: r#"
+(rule (prerequisites (word) @call.name)) @call
+(include_directive (list (word) @import.name)) @import
+"#,
+    routes: "",
+    method_parents: &[],
+    scope_kinds: &[],
+};
+
+/// A CMake `function()` or `macro()` takes its name from the first argument of
+/// its opening command, which is why the anchor matters: without it every
+/// parameter would be read as another name.
+///
+/// References are deliberately empty. Every command is a `normal_command`, so
+/// `include()` can only be told from `message()` by text, which this query
+/// engine cannot do; `extract_cmake_references` walks instead.
+static CMAKE: LanguageSpec = LanguageSpec {
+    definitions: r#"
+(function_def (function_command (argument_list . (argument) @name))) @def.function
+(macro_def (macro_command (argument_list . (argument) @name))) @def.function
+"#,
+    references: "",
+    routes: "",
+    method_parents: &[],
+    scope_kinds: &[],
 };
 
 #[cfg(test)]

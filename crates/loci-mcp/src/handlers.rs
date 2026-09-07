@@ -129,15 +129,15 @@ pub fn index_status(args: &Value) -> Result<Value> {
         .take(25)
         .map(|f| json!({ "path": f.path, "detail": f.detail }))
         .collect();
-    let skipped: Vec<Value> = reader
-        .files_with_status(loci_graph::CoverageStatus::Skipped)?
-        .iter()
-        .take(25)
-        .map(|f| {
+    let skipped_files = reader.files_with_status(loci_graph::CoverageStatus::Skipped)?;
+    let skipped: Vec<Value> = coverage::sample_files(&skipped_files, 25)
+        .into_iter()
+        .map(|s| {
             json!({
-                "path": f.path,
-                "reason": f.reason.map(|r| r.as_str()),
-                "detail": f.detail,
+                "path": s.file.path,
+                "reason": s.file.reason.map(|r| r.as_str()),
+                "detail": s.file.detail,
+                "others_like_it": s.others_like_it,
             })
         })
         .collect();

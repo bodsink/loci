@@ -107,6 +107,14 @@ pub struct IndexReport {
 pub struct CoverageExample {
     pub path: String,
     pub reason: &'static str,
+    /// Further files skipped the same way in the same directory, folded into
+    /// this one so a single noisy folder cannot fill the whole sample.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub others_like_it: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// Outcome of parsing one file, produced in parallel and applied serially.
@@ -173,11 +181,25 @@ fn extract_best_effort(
     // Try the rewrite whenever C++ is possible at all, not only when raw C++
     // already won. A heavily Qt header parses worse as raw C++ than as C, so
     // gating on the winner above would skip the very files that need this.
+    let mut prepared = None;
     if !best.1.error_ranges.is_empty()
         && (language == LanguageId::Cpp || alternative == Some(LanguageId::Cpp))
     {
-        if let Some(prepared) = loci_parse::prepare_cpp(source) {
-            best = better_of(best, LanguageId::Cpp, path, &prepared);
+        prepared = loci_parse::prepare_cpp(source);
+        if let Some(prepared) = &prepared {
+            best = better_of(best, LanguageId::Cpp, path, prepared);
+        }
+    }
+
+    // A preprocessor conditional chosen inside a single declaration defeats
+    // both attempts above, since neither branch is a construct on its own.
+    // Flattening builds on the Qt rewrite where there was one, because a file
+    // can need both.
+    let settled = best.0;
+    if !best.1.error_ranges.is_empty() && matches!(settled, LanguageId::C | LanguageId::Cpp) {
+        let base = prepared.as_deref().unwrap_or(source);
+        if let Some(flattened) = loci_parse::flatten_conditionals(base) {
+            best = better_of(best, settled, path, &flattened);
         }
     }
 
@@ -570,12 +592,12 @@ pub fn index_repository(root: &Path, options: &IndexOptions) -> Result<IndexRepo
                 None => f.path.clone(),
             })
             .collect(),
-        skipped_examples: skipped
-            .iter()
-            .take(EXAMPLE_CAP)
-            .map(|f| CoverageExample {
-                path: f.path.clone(),
-                reason: f.reason.map_or("unknown", CoverageReason::as_str),
+        skipped_examples: loci_graph::coverage::sample_files(&skipped, EXAMPLE_CAP)
+            .into_iter()
+            .map(|s| CoverageExample {
+                path: s.file.path.clone(),
+                reason: s.file.reason.map_or("unknown", CoverageReason::as_str),
+                others_like_it: s.others_like_it,
             })
             .collect(),
         bundled_languages: loci_parse::bundled_language_ids()
@@ -817,6 +839,8 @@ fn normalise_import_target(target: &str) -> String {
         .trim_start_matches("./")
         .trim_end_matches(".js")
         .trim_end_matches(".sh")
+        .trim_end_matches(".mk")
+        .trim_end_matches(".cmake")
         .replace(['/', '\\'], ".")
 }
 
