@@ -361,7 +361,13 @@ mod tests {
         assert!(String::from_utf8_lossy(&css.body).contains("--teal"));
 
         let js = dispatch("GET", "/app.js", "", b"");
-        assert!(String::from_utf8_lossy(&js.body).contains("index_repository"));
+        let js = String::from_utf8_lossy(&js.body);
+        assert!(js.contains("index_repository"));
+        assert!(
+            js.contains("data-delete") && js.contains("removeProject"),
+            "the project list must expose a remove control for an added project"
+        );
+        assert!(html.contains("Remove project"));
     }
 
     #[test]
@@ -389,6 +395,46 @@ mod tests {
             .map(|p| p["project"].as_str().unwrap())
             .collect();
         assert!(ids.contains(&project.as_str()), "{body}");
+    }
+
+    #[test]
+    fn removing_an_added_project_drops_it_from_the_list_and_leaves_source() {
+        let _lock = serial();
+        let (project, fixture) = indexed("ui-removed");
+        let source = fixture.path().to_path_buf();
+        assert!(
+            source.exists(),
+            "fixture must exist before delete so we can prove it survives"
+        );
+
+        let deleted = dispatch(
+            "POST",
+            "/api/tools/delete_project",
+            "",
+            serde_json::to_vec(&json!({ "project": project }))
+                .unwrap()
+                .as_slice(),
+        );
+        let body = json_body(&deleted);
+        assert_eq!(deleted.status, 200, "{body}");
+        assert_eq!(body["deleted"], project.as_str(), "{body}");
+
+        let listed = dispatch("POST", "/api/tools/list_projects", "", b"{}");
+        let listed = json_body(&listed);
+        let ids: Vec<&str> = listed["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["project"].as_str().unwrap())
+            .collect();
+        assert!(
+            !ids.contains(&project.as_str()),
+            "deleted project must leave the catalog: {listed}"
+        );
+        assert!(
+            source.exists(),
+            "delete_project must not touch the source repository"
+        );
     }
 
     #[test]

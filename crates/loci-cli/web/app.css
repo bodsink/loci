@@ -93,7 +93,14 @@ body {
   text-transform: uppercase;
 }
 .projects { overflow: auto; display: flex; flex-direction: column; gap: 8px; }
+.project-row {
+  display: flex;
+  align-items: stretch;
+  gap: 6px;
+}
 .project {
+  flex: 1;
+  min-width: 0;
   text-align: left;
   border: 1px solid var(--line);
   background: rgba(255,255,255,0.03);
@@ -102,12 +109,27 @@ body {
   padding: 10px 12px;
   cursor: pointer;
 }
-.project.active, .project:hover {
+.project-row.active .project, .project:hover {
   border-color: rgba(94, 234, 212, 0.4);
   background: rgba(94, 234, 212, 0.08);
 }
 .project b { display: block; }
 .project small { color: var(--muted); display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.project-remove {
+  flex: 0 0 auto;
+  align-self: stretch;
+  border: 1px solid var(--line);
+  background: rgba(255,255,255,0.03);
+  color: var(--muted);
+  border-radius: 12px;
+  padding: 0 10px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.project-remove:hover {
+  border-color: var(--rose);
+  color: var(--rose);
+}
 
 .stage {
   margin-left: 280px;

@@ -110,14 +110,23 @@ function renderProjects() {
   $("projects").innerHTML = state.projects
     .map(
       (p) => `
-      <button class="project ${p.project === state.project ? "active" : ""}" data-id="${esc(p.project)}">
-        <b>${esc(p.name || p.project)}</b>
-        <small>${esc(p.root)}</small>
-      </button>`
+      <div class="project-row ${p.project === state.project ? "active" : ""}">
+        <button class="project" type="button" data-id="${esc(p.project)}">
+          <b>${esc(p.name || p.project)}</b>
+          <small>${esc(p.root)}</small>
+        </button>
+        <button class="project-remove" type="button" data-delete="${esc(p.project)}" title="Remove ${esc(p.name || p.project)}">Remove</button>
+      </div>`
     )
     .join("") || `<div class="empty">No projects yet.</div>`;
   $("projects").querySelectorAll(".project").forEach((btn) => {
     btn.onclick = () => selectProject(btn.dataset.id);
+  });
+  $("projects").querySelectorAll("[data-delete]").forEach((btn) => {
+    btn.onclick = (ev) => {
+      ev.stopPropagation();
+      removeProject(btn.dataset.delete);
+    };
   });
 }
 
@@ -808,13 +817,27 @@ $("reindex").onclick = async () => {
     toast(error.message, "err");
   }
 };
-$("delete-project").onclick = async () => {
-  if (!state.project) return;
-  if (!confirm(`Delete the graph for ${state.project}? Source is not touched.`)) return;
-  await apiTool("delete_project", { project: state.project });
-  state.project = null;
-  await loadProjects();
-};
+async function removeProject(id) {
+  if (!id) return;
+  const entry = state.projects.find((p) => p.project === id);
+  const label = entry?.name || id;
+  if (!confirm(`Remove ${label} from Loci? The source repository is not touched.`)) return;
+  try {
+    await apiTool("delete_project", { project: id });
+    if (state.project === id) {
+      state.project = null;
+      state.status = null;
+      state.architecture = null;
+      state.graph = null;
+    }
+    toast(`Removed ${label}`);
+    await loadProjects();
+  } catch (error) {
+    toast(error.message, "err");
+  }
+}
+
+$("delete-project").onclick = () => removeProject(state.project);
 $("tabs").onclick = async (ev) => {
   const btn = ev.target.closest("[data-tab]");
   if (!btn) return;
