@@ -182,7 +182,8 @@ fn an_incrementally_built_graph_matches_a_full_rebuild_at_every_step() {
         let incremental = edge_fingerprint("eq-incremental");
         let rebuilt = edge_fingerprint("eq-rebuilt");
         assert_eq!(
-            incremental, rebuilt,
+            incremental,
+            rebuilt,
             "edges diverged at step {step}\nonly incremental: {:?}\nonly rebuilt: {:?}",
             incremental.difference(&rebuilt).collect::<Vec<_>>(),
             rebuilt.difference(&incremental).collect::<Vec<_>>(),
@@ -240,13 +241,19 @@ fn indexing_the_same_tree_twice_produces_the_same_graph() {
         );
     }
 
-    assert_eq!(first_nodes, second_nodes, "nodes differ between two indexes");
+    assert_eq!(
+        first_nodes, second_nodes,
+        "nodes differ between two indexes"
+    );
     assert_eq!(
         first_edges.len(),
         second_edges.len(),
         "edge count differs between two indexes of the same tree"
     );
-    assert_eq!(first_edges, second_edges, "edges differ between two indexes");
+    assert_eq!(
+        first_edges, second_edges,
+        "edges differ between two indexes"
+    );
 }
 
 /// The interesting steps must actually exercise resolution, otherwise the

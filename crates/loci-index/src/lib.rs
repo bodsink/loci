@@ -146,6 +146,66 @@ fn format_error_ranges(ranges: &[(u32, u32)]) -> String {
 
 /// Read and parse one candidate. Never panics on bad input; failures become
 /// coverage records.
+/// Extract with the mapped grammar, and for ambiguous extensions fall back to
+/// the alternative when the first choice does not fit.
+///
+/// `.h` is the case that matters: the extension says nothing about whether the
+/// file is C or C++. Mapping it to C alone shreds every C++ header — a Qt
+/// project here reported 59 of 245 files as partial, and one 19-line header
+/// produced 10 parse errors under C and none under C++. Choosing by measured
+/// error count rather than by extension keeps plain C headers on the C grammar,
+/// where a few C constructs are not valid C++.
+fn extract_best_effort(
+    language: LanguageId,
+    path: &str,
+    source: &str,
+) -> loci_core::Result<(LanguageId, loci_parse::ExtractedFile)> {
+    let mut best = (language, loci_parse::extract(language, path, source)?);
+    if best.1.error_ranges.is_empty() {
+        return Ok(best);
+    }
+
+    let alternative = ambiguous_alternative(language, path);
+    if let Some(alternative) = alternative {
+        best = better_of(best, alternative, path, source);
+    }
+
+    // Try the rewrite whenever C++ is possible at all, not only when raw C++
+    // already won. A heavily Qt header parses worse as raw C++ than as C, so
+    // gating on the winner above would skip the very files that need this.
+    if !best.1.error_ranges.is_empty()
+        && (language == LanguageId::Cpp || alternative == Some(LanguageId::Cpp))
+    {
+        if let Some(prepared) = loci_parse::prepare_cpp(source) {
+            best = better_of(best, LanguageId::Cpp, path, &prepared);
+        }
+    }
+
+    Ok(best)
+}
+
+/// Keep `candidate` only if it parses `text` with fewer errors than `best`.
+fn better_of(
+    best: (LanguageId, loci_parse::ExtractedFile),
+    candidate: LanguageId,
+    path: &str,
+    text: &str,
+) -> (LanguageId, loci_parse::ExtractedFile) {
+    match loci_parse::extract(candidate, path, text) {
+        Ok(other) if other.error_ranges.len() < best.1.error_ranges.len() => (candidate, other),
+        _ => best,
+    }
+}
+
+/// The other language a path's extension could plausibly mean.
+fn ambiguous_alternative(language: LanguageId, path: &str) -> Option<LanguageId> {
+    let extension = path.rsplit('.').next()?;
+    match (language, extension) {
+        (LanguageId::C, "h") => Some(LanguageId::Cpp),
+        _ => None,
+    }
+}
+
 fn process_file(candidate: &Candidate) -> FileOutcome {
     let mut outcome = FileOutcome {
         relative_path: candidate.relative_path.clone(),
@@ -206,8 +266,9 @@ fn process_file(candidate: &Candidate) -> FileOutcome {
     };
     outcome.line_count = source.lines().count().max(1) as u32;
 
-    match loci_parse::extract(language, &candidate.relative_path, &source) {
-        Ok(extracted) => {
+    match extract_best_effort(language, &candidate.relative_path, &source) {
+        Ok((language, extracted)) => {
+            outcome.language = Some(language);
             if extracted.error_ranges.is_empty() {
                 outcome.status = CoverageStatus::Indexed;
             } else {
@@ -755,6 +816,7 @@ fn normalise_import_target(target: &str) -> String {
     target
         .trim_start_matches("./")
         .trim_end_matches(".js")
+        .trim_end_matches(".sh")
         .replace(['/', '\\'], ".")
 }
 

@@ -101,16 +101,62 @@ enclosing definition, then the symbol. For example
 
 ## Languages
 
-Thirteen language IDs have a real tree-sitter grammar linked into the binary:
+Seventeen language IDs have a real tree-sitter grammar linked into the binary.
 
-Python · JavaScript · JSX · TypeScript · TSX · Go · Rust · C · C++ · Java · C# · Kotlin · Perl
+Code: Python · JavaScript · JSX · TypeScript · TSX · Go · Rust · C · C++ · Java · C# · Kotlin ·
+Perl · Shell
 
-This is exactly the set named for Hybrid LSP, so no language the engine advertises can turn out to
-be unparseable. `get_graph_schema` reports the list with the upstream crate behind each grammar so
-it can be audited. PHP is out of scope by design and CI fails if it reappears.
+Configuration: TOML · YAML · INI
+
+Every language named for Hybrid LSP is in that list, so no language the engine advertises can turn
+out to be unparseable. The reverse no longer holds: shell and the configuration formats are parsed
+but have no server in scope, and `hybrid_lsp_eligible` reports false for them.
+`get_graph_schema` reports the list with the upstream crate behind each grammar so it can be
+audited. PHP is out of scope by design and CI fails if it reappears.
+
+Shell is included because packaging trees are mostly shell: build scripts, and Debian maintainer
+scripts like `postinst` that carry no extension at all. Those are found by their `#!` line, which is
+read only for extensionless files. `source lib.sh` and `. lib.sh` become import edges rather than
+calls to a function named `source`, with the target resolved against the script's own directory.
+
+### Configuration formats
+
+Config says which binary a service runs and which job a pipeline executes, so leaving it out makes
+those questions unanswerable. A section becomes a `Module` and a key a `Field`, reusing labels that
+already exist rather than inventing a category. A systemd unit is INI, and is recognised by its unit
+suffix (`.service`, `.socket`, `.timer`, and the rest) rather than by an `.ini` extension.
+
+YAML has no sections, only nesting, so a key is classified by its value: a block value makes it a
+`Module`, a scalar makes it a `Field`. Without that split every `runs-on` in a workflow would share
+one qualified name.
+
+Dotted directories are still pruned, with a short allowlist — `.github`, `.gitlab`, `.circleci` —
+because a CI workflow is tracked source that says how the project is built. `.git` and `.venv` stay
+out.
 
 Route extraction currently recognises FastAPI, Express, net/http, axum, and ASP.NET attribute
 routes. Other frameworks produce no `Route` nodes rather than guessed ones.
+
+### C, C++ and Qt
+
+A `.h` file gives no clue whether it is C or C++, so the extension is not trusted. Both grammars are
+tried and the one with fewer parse errors wins, which keeps C++ headers off the C grammar without
+pushing C headers onto a grammar that reserves `class` and `new`.
+
+The bundled grammar is standards C++, so several ordinary constructs would otherwise shred a file.
+Qt's moc keywords (`Q_OBJECT`, `signals:`, `emit`) are macros a compliant parser never sees.
+`QTEST_MAIN(T)` and `Q_ARG(int, x)` are not parseable calls, the latter because its first argument
+is a type. And `= {}` as a default argument is rejected outright. When a direct parse fails, the
+source is rewritten in memory with those neutralised — byte lengths preserved, so reported lines and
+offsets still point at the real file — and the result is kept only if it parses better. Files the
+grammar already handles are never rewritten, and nothing on disk is touched.
+
+A side effect is fewer false edges: `Q_ARG` and friends were previously read as function calls, and
+they are macros, not functions.
+
+On a 94-file Qt codebase this took the files reported as `parse_partial` from 59 to 1. The one
+holdout is a preprocessor conditional splitting a single expression across `#ifdef` branches, which
+the grammar cannot represent; it stays reported rather than papered over.
 
 ## Honest limits
 

@@ -49,6 +49,10 @@ pub fn spec_for(language: LanguageId) -> Option<&'static LanguageSpec> {
         LanguageId::CSharp => &CSHARP,
         LanguageId::Kotlin => &KOTLIN,
         LanguageId::Perl => &PERL,
+        LanguageId::Bash => &BASH,
+        LanguageId::Toml => &TOML,
+        LanguageId::Yaml => &YAML,
+        LanguageId::Ini => &INI,
     })
 }
 
@@ -214,6 +218,13 @@ static C: LanguageSpec = LanguageSpec {
 (function_definition
   declarator: (pointer_declarator
     declarator: (function_declarator declarator: (identifier) @name))) @def.function
+; Prototypes. A header is nothing but these, so without them a C API is
+; invisible to the graph and calls into it resolve to nothing.
+(declaration
+  declarator: (function_declarator declarator: (identifier) @name)) @def.function
+(declaration
+  declarator: (pointer_declarator
+    declarator: (function_declarator declarator: (identifier) @name))) @def.function
 (struct_specifier name: (type_identifier) @name body: (field_declaration_list)) @def.struct
 (enum_specifier name: (type_identifier) @name body: (enumerator_list)) @def.enum
 "#,
@@ -239,6 +250,22 @@ static CPP: LanguageSpec = LanguageSpec {
     declarator: (qualified_identifier name: (identifier) @name))) @def.method
 (function_definition
   declarator: (function_declarator declarator: (field_identifier) @name)) @def.method
+; Member declarations. Qt and most C++ put the whole class API in a header as
+; bodiless declarations, so matching only `function_definition` loses it all.
+(field_declaration
+  declarator: (function_declarator declarator: (field_identifier) @name)) @def.method
+(field_declaration
+  declarator: (pointer_declarator
+    declarator: (function_declarator declarator: (field_identifier) @name))) @def.method
+(field_declaration
+  declarator: (reference_declarator
+    (function_declarator declarator: (field_identifier) @name))) @def.method
+; Free function prototypes.
+(declaration
+  declarator: (function_declarator declarator: (identifier) @name)) @def.function
+(declaration
+  declarator: (pointer_declarator
+    declarator: (function_declarator declarator: (identifier) @name))) @def.function
 (class_specifier name: (type_identifier) @name body: (field_declaration_list)) @def.class
 (struct_specifier name: (type_identifier) @name body: (field_declaration_list)) @def.struct
 (enum_specifier name: (type_identifier) @name body: (enumerator_list)) @def.enum
@@ -398,6 +425,63 @@ pub const HTTP_VERBS: &[&str] = &[
 
 /// Framework-specific registration helpers that carry the verb elsewhere.
 pub const ROUTE_REGISTRARS: &[&str] = &["route", "handlefunc", "handle", "add_route"];
+
+/// References are deliberately empty: shell calls and `source` lines are the
+/// same node kind and can only be told apart by text, which this query engine
+/// cannot do. `extract_shell_references` handles both by walking instead.
+static BASH: LanguageSpec = LanguageSpec {
+    definitions: r#"
+(function_definition name: (word) @name) @def.function
+"#,
+    references: "",
+    routes: "",
+    method_parents: &[],
+    scope_kinds: &[],
+};
+
+/// A table is the nearest thing TOML has to a module, and a pair to a field.
+/// The table's own key is a direct child, while a pair's key sits under `pair`,
+/// so the two patterns cannot collide.
+static TOML: LanguageSpec = LanguageSpec {
+    definitions: r#"
+(table (bare_key) @name) @def.module
+(table (dotted_key) @name) @def.module
+(pair (bare_key) @name) @def.field
+"#,
+    references: "",
+    routes: "",
+    method_parents: &[],
+    scope_kinds: &["table"],
+};
+
+/// YAML has no sections, only nesting, so a key is classified by the shape of
+/// its value: a block value means it contains other keys, a scalar means it is
+/// a leaf. The split is not cosmetic — qualified names are built from enclosing
+/// definitions that are not fields, so without it every `runs-on` in a workflow
+/// would collapse to the same name. The two patterns are mutually exclusive.
+static YAML: LanguageSpec = LanguageSpec {
+    definitions: r#"
+(block_mapping_pair key: (flow_node) @name value: (block_node)) @def.module
+(block_mapping_pair key: (flow_node) @name value: (flow_node)) @def.field
+"#,
+    references: "",
+    routes: "",
+    method_parents: &[],
+    scope_kinds: &[],
+};
+
+/// Also the shape of a systemd unit, where `[Service]` is the section and
+/// `ExecStart=` the setting.
+static INI: LanguageSpec = LanguageSpec {
+    definitions: r#"
+(section (section_name (text) @name)) @def.module
+(setting (setting_name) @name) @def.field
+"#,
+    references: "",
+    routes: "",
+    method_parents: &[],
+    scope_kinds: &["section"],
+};
 
 #[cfg(test)]
 mod tests {

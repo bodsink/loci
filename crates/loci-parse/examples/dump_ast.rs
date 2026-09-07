@@ -11,13 +11,33 @@ fn main() {
     let language = args.next().expect("language id");
     let language = LanguageId::from_str_id(&language).expect("known language");
 
+    // `--qt` runs the source through the same Qt keyword neutraliser the
+    // indexer uses, so what is dumped is what the indexer actually parsed.
+    let neutralise = args.next().as_deref() == Some("--qt");
+
     let mut source = String::new();
     std::io::stdin().read_to_string(&mut source).expect("stdin");
+    if neutralise {
+        if let Some(rewritten) = loci_parse::prepare_cpp(&source) {
+            source = rewritten;
+        }
+    }
 
     let grammar = loci_parse::grammar(language).expect("bundled grammar");
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&grammar).expect("set language");
     let tree = parser.parse(&source, None).expect("parse");
+
+    // The tree dump only shows named nodes, so a MISSING node the parser
+    // inserted while recovering is invisible in it. Report the ranges the
+    // indexer actually records, or a dump looks clean when indexing is not.
+    match loci_parse::extract(language, "dump.txt", &source) {
+        Ok(extracted) if !extracted.error_ranges.is_empty() => {
+            println!("error_ranges: {:?}", extracted.error_ranges);
+        }
+        Ok(_) => println!("error_ranges: none"),
+        Err(e) => println!("extract failed: {e}"),
+    }
 
     print(tree.root_node(), &source, 0);
 }

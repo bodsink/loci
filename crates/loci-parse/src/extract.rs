@@ -234,6 +234,9 @@ pub fn extract(language: LanguageId, relative_path: &str, source: &str) -> Resul
     let prefix = module_prefix(relative_path);
     extract_definitions(&mut extracted, &grammar, spec, root, source, &prefix)?;
     extract_references(&mut extracted, &grammar, spec, root, source)?;
+    if language == LanguageId::Bash {
+        extract_shell_references(&mut extracted, root, source, relative_path);
+    }
     extract_routes(&mut extracted, &grammar, spec, root, source, language)?;
 
     Ok(extracted)
@@ -339,6 +342,82 @@ fn extract_definitions(
     }
 
     Ok(())
+}
+
+/// Turn a `source` argument into a repository-relative path.
+///
+/// A shell script sources relative to its own directory, while a File node is
+/// named from the repository root, so `source ./lib.sh` inside `scripts/build.sh`
+/// has to become `scripts/lib.sh` or the edge lands nowhere. Targets that
+/// escape the repository, or that interpolate a variable, are returned as
+/// written: they will simply fail to match, which is better than inventing a
+/// path.
+fn resolve_shell_target(relative_path: &str, target: &str) -> String {
+    if target.starts_with('/') || target.contains('$') {
+        return target.to_string();
+    }
+    let mut parts: Vec<&str> = relative_path.split('/').collect();
+    parts.pop();
+    for segment in target.split('/') {
+        match segment {
+            "." | "" => {}
+            ".." => {
+                if parts.pop().is_none() {
+                    return target.to_string();
+                }
+            }
+            other => parts.push(other),
+        }
+    }
+    parts.join("/")
+}
+
+/// Shell calls and `source` lines, resolved by walking rather than by query.
+///
+/// In shell, `source lib.sh` and `. lib.sh` are ordinary commands. Only the
+/// command's own text separates an import from a call, and the query engine
+/// here has no text predicates: writing `#eq?` would parse but never be
+/// applied, so every command would be filed as an import. Walking is the
+/// honest way to tell them apart, and it keeps `source` from becoming a call
+/// edge to a function that does not exist.
+fn extract_shell_references(
+    out: &mut ExtractedFile,
+    root: TsNode,
+    source: &str,
+    relative_path: &str,
+) {
+    let mut cursor = root.walk();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+        if node.kind() != "command" {
+            continue;
+        }
+        let Some(name_node) = node.child_by_field_name("name") else {
+            continue;
+        };
+        let name = text(name_node, source);
+
+        if name == "source" || name == "." {
+            if let Some(argument) = node.child_by_field_name("argument") {
+                out.imports.push(ImportRef {
+                    target: resolve_shell_target(relative_path, &unquote(text(argument, source))),
+                    line: line_of(argument),
+                });
+            }
+            continue;
+        }
+
+        out.calls.push(CallSite {
+            callee_name: name.to_string(),
+            receiver: None,
+            line: line_of(name_node),
+            character: utf16_column(name_node, source),
+            byte: name_node.start_byte(),
+        });
+    }
 }
 
 fn extract_references(
@@ -615,4 +694,52 @@ pub fn label_histogram(extracted: &ExtractedFile) -> BTreeMap<&'static str, usiz
         *counts.entry(def.label.as_str()).or_insert(0) += 1;
     }
     counts
+}
+
+#[cfg(test)]
+mod shell_target_tests {
+    use super::resolve_shell_target;
+
+    #[test]
+    fn a_sibling_resolves_against_the_script_directory() {
+        assert_eq!(
+            resolve_shell_target("scripts/build.sh", "./lib.sh"),
+            "scripts/lib.sh"
+        );
+        assert_eq!(
+            resolve_shell_target("scripts/build.sh", "lib.sh"),
+            "scripts/lib.sh"
+        );
+    }
+
+    #[test]
+    fn parent_segments_are_followed() {
+        assert_eq!(
+            resolve_shell_target("packaging/deb/postinst", "../common/env.sh"),
+            "packaging/common/env.sh"
+        );
+    }
+
+    #[test]
+    fn a_script_at_the_root_keeps_a_bare_name() {
+        assert_eq!(resolve_shell_target("build.sh", "./lib.sh"), "lib.sh");
+    }
+
+    /// Nothing in the repository can match these, and guessing a path would be
+    /// worse than recording the target as written.
+    #[test]
+    fn targets_that_cannot_be_resolved_are_left_alone() {
+        assert_eq!(
+            resolve_shell_target("scripts/build.sh", "/etc/profile"),
+            "/etc/profile"
+        );
+        assert_eq!(
+            resolve_shell_target("scripts/build.sh", "$HOME/lib.sh"),
+            "$HOME/lib.sh"
+        );
+        assert_eq!(
+            resolve_shell_target("build.sh", "../outside.sh"),
+            "../outside.sh"
+        );
+    }
 }

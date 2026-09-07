@@ -4,9 +4,12 @@
 //! Asking for anything else returns [`loci_core::LociError::LanguageUnsupported`]
 //! rather than a silent empty result.
 
+pub mod dialect;
 pub mod extract;
 pub mod registry;
 pub mod spec;
+
+pub use dialect::prepare_cpp;
 
 pub use extract::{
     extract, module_prefix, CallSite, Definition, ExtractedFile, ImportRef, RouteDef, TypeRel,

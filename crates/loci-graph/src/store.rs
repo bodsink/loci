@@ -335,7 +335,11 @@ impl GraphWriter {
     /// everything costs time proportional to the whole graph even when one file
     /// changed, which is the difference between a one second and a one minute
     /// re-index on a large repository.
-    pub fn clear_resolved_edges_for_files(&self, paths: &[String], types: &[EdgeType]) -> Result<()> {
+    pub fn clear_resolved_edges_for_files(
+        &self,
+        paths: &[String],
+        types: &[EdgeType],
+    ) -> Result<()> {
         let mut node_ids: Vec<u64> = Vec::new();
         {
             let files = self.tx.open_multimap_table(FILE_INDEX).map_err(storage)?;

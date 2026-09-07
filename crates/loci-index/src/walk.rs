@@ -22,7 +22,30 @@ pub fn collect(sandbox: &Sandbox) -> Vec<Candidate> {
     let mut candidates = Vec::new();
 
     let walker = WalkBuilder::new(sandbox.root())
-        .hidden(true)
+        // Dotted paths are filtered below rather than by `hidden`, so that a
+        // few tracked configuration directories can be let back in.
+        .hidden(false)
+        .filter_entry(|entry| {
+            let name = entry.file_name().to_string_lossy();
+            // Never judge the project root by its own name; it may well be
+            // inside a dotted directory.
+            if entry.depth() == 0 || !name.starts_with('.') {
+                return true;
+            }
+            if !entry.file_type().is_some_and(|t| t.is_dir()) {
+                // An ignore file is an input to this walk, not a subject of
+                // it: reporting `.gitignore` as an unindexable file crowds the
+                // coverage sample with something that could never be code.
+                if name.ends_with("ignore") {
+                    return false;
+                }
+                // Any other dotted file that survived .gitignore is deliberate
+                // project content: `.air.toml`, `.gitlab-ci.yml`. Hiding it
+                // second-guesses a decision the repository already made.
+                return true;
+            }
+            TRACKED_DOT_DIRECTORIES.contains(&name.as_ref())
+        })
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
@@ -52,12 +75,43 @@ pub fn collect(sandbox: &Sandbox) -> Vec<Candidate> {
             relative_path: to_slash(&relative),
             absolute_path: absolute.to_path_buf(),
             size,
-            language: LanguageId::from_path(absolute),
+            language: detect_language(absolute, size),
         });
     }
 
     candidates.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     candidates
+}
+
+/// Dot-directories that hold version-controlled project configuration.
+///
+/// Hiding every dotted path keeps `.git` and `.venv` out, which is right, but
+/// it also hides CI definitions: a workflow under `.github` is tracked source
+/// that says how the project is built. Only these names are re-admitted, and
+/// `.git` is deliberately not among them.
+const TRACKED_DOT_DIRECTORIES: &[&str] = &[".github", ".gitlab", ".circleci"];
+
+/// Language for a path, falling back to its `#!` line when the name carries no
+/// extension.
+///
+/// Only extensionless files are sniffed, and only their first line is read, so
+/// the walk stays a stat-and-name pass for everything else. Package maintainer
+/// scripts and git hooks are real code that would otherwise be skipped as an
+/// unknown language purely for lacking a suffix.
+fn detect_language(absolute: &Path, size: u64) -> Option<LanguageId> {
+    if let Some(language) = LanguageId::from_path(absolute) {
+        return Some(language);
+    }
+    if absolute.extension().is_some() || size == 0 || is_oversized(size) {
+        return None;
+    }
+    use std::io::{BufRead, Read};
+    let file = std::fs::File::open(absolute).ok()?;
+    let mut first = String::new();
+    // A shebang is at most a couple of hundred bytes; a binary's first "line"
+    // may be enormous, so cap what is read rather than trusting the file.
+    BufRead::read_line(&mut std::io::BufReader::new(file.take(512)), &mut first).ok()?;
+    LanguageId::from_shebang(first.trim_end())
 }
 
 pub fn to_slash(path: &Path) -> String {

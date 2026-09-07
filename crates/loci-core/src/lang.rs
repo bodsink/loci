@@ -20,6 +20,13 @@ pub enum LanguageId {
     CSharp,
     Kotlin,
     Perl,
+    /// AST only. There is no shell entry in the Hybrid LSP scope.
+    Bash,
+    /// Configuration formats. Parsed for structure, never LSP-resolved.
+    Toml,
+    Yaml,
+    /// INI, which is also the shape of a systemd unit.
+    Ini,
 }
 
 impl LanguageId {
@@ -38,6 +45,10 @@ impl LanguageId {
             Self::CSharp => "csharp",
             Self::Kotlin => "kotlin",
             Self::Perl => "perl",
+            Self::Bash => "bash",
+            Self::Toml => "toml",
+            Self::Yaml => "yaml",
+            Self::Ini => "ini",
         }
     }
 
@@ -56,21 +67,27 @@ impl LanguageId {
             "csharp" => Self::CSharp,
             "kotlin" => Self::Kotlin,
             "perl" => Self::Perl,
+            "bash" => Self::Bash,
+            "toml" => Self::Toml,
+            "yaml" => Self::Yaml,
+            "ini" => Self::Ini,
             _ => return None,
         })
     }
 
-    /// Languages eligible for Hybrid LSP type resolution once `loci-lsp` ships.
-    /// Matches the product scope exactly; PHP is not and will not be a member.
+    /// Languages eligible for Hybrid LSP type resolution.
+    ///
+    /// No longer every bundled language: shell is parsed but has no server in
+    /// the product scope. PHP is not and will not be a member.
     pub const fn hybrid_lsp_eligible(self) -> bool {
-        true
+        !matches!(self, Self::Bash | Self::Toml | Self::Yaml | Self::Ini)
     }
 
     /// Best-effort language detection from a file extension.
     ///
-    /// Header files map to C; a C++ project's `.h` files are re-tagged by the
-    /// indexer only when a sibling C++ translation unit exists, which M1 does
-    /// not attempt. Returning C here is a documented, conservative choice.
+    /// `.h` maps to C, but the extension does not settle it: the indexer parses
+    /// ambiguous headers with both grammars and keeps whichever reports fewer
+    /// errors, so a C++ header is not condemned to the C grammar.
     pub fn from_extension(ext: &str) -> Option<Self> {
         Some(match ext {
             "py" | "pyi" => Self::Python,
@@ -86,6 +103,12 @@ impl LanguageId {
             "cs" => Self::CSharp,
             "kt" | "kts" => Self::Kotlin,
             "pl" | "pm" => Self::Perl,
+            "sh" | "bash" => Self::Bash,
+            "toml" => Self::Toml,
+            "yaml" | "yml" => Self::Yaml,
+            // systemd unit files are INI with a fixed set of suffixes.
+            "ini" | "cfg" | "service" | "socket" | "timer" | "target" | "mount" | "path"
+            | "slice" => Self::Ini,
             _ => return None,
         })
     }
@@ -93,6 +116,30 @@ impl LanguageId {
     pub fn from_path(path: &std::path::Path) -> Option<Self> {
         let ext = path.extension()?.to_str()?;
         Self::from_extension(ext)
+    }
+
+    /// Language named by a `#!` line, for files that carry no extension.
+    ///
+    /// Package maintainer scripts (`postinst`, `prerm`) and hooks are real code
+    /// with no suffix to go on, so the interpreter is the only honest signal.
+    /// Only the first line is considered, and only shells are recognised: the
+    /// point is to stop losing scripts, not to guess at every interpreter.
+    pub fn from_shebang(first_line: &str) -> Option<Self> {
+        let line = first_line.strip_prefix("#!")?.trim();
+        if line.is_empty() {
+            return None;
+        }
+        // `#!/usr/bin/env bash -e` names the interpreter in the second word.
+        let mut words = line.split_whitespace();
+        let command = words.next()?;
+        let mut interpreter = command.rsplit('/').next()?;
+        if interpreter == "env" {
+            interpreter = words.find(|w| !w.starts_with('-'))?;
+        }
+        match interpreter {
+            "sh" | "bash" | "dash" | "zsh" | "ash" => Some(Self::Bash),
+            _ => None,
+        }
     }
 }
 
@@ -131,6 +178,47 @@ mod tests {
         ] {
             assert_eq!(LanguageId::from_str_id(lang.as_str()), Some(lang));
         }
+    }
+
+    /// Debian maintainer scripts carry no extension, so without this they are
+    /// skipped as an unknown language despite being ordinary shell.
+    #[test]
+    fn detects_shell_from_a_shebang() {
+        for line in [
+            "#!/bin/sh",
+            "#!/bin/bash",
+            "#!/usr/bin/env bash",
+            "#!/usr/bin/env -S bash -e",
+            "#! /bin/sh",
+            "#!/bin/bash -eu",
+        ] {
+            assert_eq!(
+                LanguageId::from_shebang(line),
+                Some(LanguageId::Bash),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_shebang_for_anything_else_is_not_guessed_at() {
+        for line in [
+            "#!/usr/bin/env python3",
+            "#!/usr/bin/perl",
+            "#!/usr/bin/awk -f",
+            "not a shebang",
+            "#!",
+            "",
+        ] {
+            assert_eq!(LanguageId::from_shebang(line), None, "{line}");
+        }
+    }
+
+    #[test]
+    fn shell_is_parsed_but_is_not_an_lsp_language() {
+        assert_eq!(LanguageId::from_extension("sh"), Some(LanguageId::Bash));
+        assert!(!LanguageId::Bash.hybrid_lsp_eligible());
+        assert!(LanguageId::Go.hybrid_lsp_eligible());
     }
 
     #[test]

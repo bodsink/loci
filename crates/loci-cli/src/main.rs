@@ -201,10 +201,16 @@ fn cmd_install(client: &str, as_json: bool) -> Result<()> {
         println!("{} is not on your PATH.", install_dir.display());
         println!("Cursor will still work, but the `loci` command will not. To fix it:");
         println!();
-        println!("  echo 'export PATH=\"{}:$PATH\"' >> ~/.bashrc && exec bash", install_dir.display());
+        println!(
+            "  echo 'export PATH=\"{}:$PATH\"' >> ~/.bashrc && exec bash",
+            install_dir.display()
+        );
         println!();
         println!("Next:");
-        println!("  1. {} index /path/to/your/repo", outcome.binary_path.display());
+        println!(
+            "  1. {} index /path/to/your/repo",
+            outcome.binary_path.display()
+        );
     }
     println!("  2. Reload MCP servers in Cursor (Settings -> MCP -> refresh, or restart Cursor).");
     println!("  3. Ask the agent to call list_projects.");
@@ -294,7 +300,7 @@ fn cmd_index(
         }
     }
     println!();
-    println!("{}", report.coverage_note);
+    print_note(report.coverage_note);
     Ok(())
 }
 
@@ -400,7 +406,7 @@ fn cmd_status(project: Option<&str>, agent_usage: bool, as_json: bool) -> Result
         .collect();
     println!("  labels : {}", rendered.join(", "));
     println!();
-    println!("{}", coverage::COVERAGE_NOTE);
+    print_note(coverage::COVERAGE_NOTE);
     Ok(())
 }
 
@@ -506,6 +512,36 @@ fn cmd_delete(project: &str, as_json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Print the coverage caveat folded onto short lines.
+///
+/// The note is one 191-character string because MCP returns it as a JSON
+/// field. Left to the terminal, it soft-wraps at whatever the window happens
+/// to be, and a copied transcript then shows the wrap point as a missing
+/// space. Folding it here makes the printed form independent of window width.
+fn print_note(note: &str) {
+    for line in fold(note, 78) {
+        println!("{line}");
+    }
+}
+
+fn fold(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
 fn cmd_mcp() -> Result<()> {
     let stdin = std::io::stdin();
     if stdin.is_terminal() {
@@ -520,4 +556,47 @@ fn cmd_mcp() -> Result<()> {
     let output = std::io::stdout();
     loci_mcp::serve_stdio(stdin.lock(), output.lock())
         .map_err(|e| LociError::io(PathBuf::from("<stdio>"), e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fold;
+
+    #[test]
+    fn folding_keeps_every_word_and_respects_the_width() {
+        let folded = fold(loci_graph::coverage::COVERAGE_NOTE, 78);
+
+        assert!(
+            folded.len() > 1,
+            "a 191-character note must not stay on one line"
+        );
+        for line in &folded {
+            assert!(
+                line.chars().count() <= 78,
+                "line exceeds the width: {line:?}"
+            );
+        }
+        assert_eq!(
+            folded.join(" "),
+            loci_graph::coverage::COVERAGE_NOTE,
+            "folding must not drop or add a word"
+        );
+    }
+
+    /// The wrap point is where a space goes missing when a soft-wrapped
+    /// terminal is copied, so the phrase either side of it must stay intact.
+    #[test]
+    fn a_word_is_never_split_across_lines() {
+        for line in fold(loci_graph::coverage::COVERAGE_NOTE, 78) {
+            assert!(
+                !line.starts_with(' ') && !line.ends_with(' '),
+                "a line must not carry padding: {line:?}"
+            );
+        }
+        assert_eq!(
+            fold("alpha beta gamma", 11),
+            vec!["alpha beta", "gamma"],
+            "words must break only at spaces"
+        );
+    }
 }

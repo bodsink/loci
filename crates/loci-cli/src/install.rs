@@ -186,7 +186,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("mcp.json");
 
-        let outcome = install_for_cursor(&config, Path::new("/usr/local/bin/loci"), BinaryOutcome::AlreadyInPlace).unwrap();
+        let outcome = install_for_cursor(
+            &config,
+            Path::new("/usr/local/bin/loci"),
+            BinaryOutcome::AlreadyInPlace,
+        )
+        .unwrap();
         assert!(outcome.created_config);
 
         let written: Value = serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
@@ -207,7 +212,12 @@ mod tests {
         )
         .unwrap();
 
-        let outcome = install_for_cursor(&config, Path::new("/usr/local/bin/loci"), BinaryOutcome::AlreadyInPlace).unwrap();
+        let outcome = install_for_cursor(
+            &config,
+            Path::new("/usr/local/bin/loci"),
+            BinaryOutcome::AlreadyInPlace,
+        )
+        .unwrap();
         assert_eq!(outcome.other_servers, vec!["codebase-memory-mcp"]);
 
         let written: Value = serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
@@ -224,7 +234,12 @@ mod tests {
         let config = dir.path().join("mcp.json");
         std::fs::write(&config, r#"{"mcpServers":{}}"#).unwrap();
 
-        let outcome = install_for_cursor(&config, Path::new("/bin/loci"), BinaryOutcome::AlreadyInPlace).unwrap();
+        let outcome = install_for_cursor(
+            &config,
+            Path::new("/bin/loci"),
+            BinaryOutcome::AlreadyInPlace,
+        )
+        .unwrap();
         let backup = outcome.backup_path.expect("a backup must be written");
         assert!(backup.exists());
     }
@@ -234,8 +249,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("mcp.json");
 
-        install_for_cursor(&config, Path::new("/old/loci"), BinaryOutcome::AlreadyInPlace).unwrap();
-        let outcome = install_for_cursor(&config, Path::new("/new/loci"), BinaryOutcome::AlreadyInPlace).unwrap();
+        install_for_cursor(
+            &config,
+            Path::new("/old/loci"),
+            BinaryOutcome::AlreadyInPlace,
+        )
+        .unwrap();
+        let outcome = install_for_cursor(
+            &config,
+            Path::new("/new/loci"),
+            BinaryOutcome::AlreadyInPlace,
+        )
+        .unwrap();
 
         assert!(outcome.replaced_existing_entry);
         let written: Value = serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
@@ -261,8 +286,15 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&destination).unwrap().permissions().mode();
-            assert_eq!(mode & 0o111, 0o111, "the installed binary must be executable");
+            let mode = std::fs::metadata(&destination)
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o111,
+                0o111,
+                "the installed binary must be executable"
+            );
         }
     }
 
@@ -330,7 +362,12 @@ mod tests {
         let config = dir.path().join("mcp.json");
         std::fs::write(&config, "{ this is not json").unwrap();
 
-        let err = install_for_cursor(&config, Path::new("/bin/loci"), BinaryOutcome::AlreadyInPlace).unwrap_err();
+        let err = install_for_cursor(
+            &config,
+            Path::new("/bin/loci"),
+            BinaryOutcome::AlreadyInPlace,
+        )
+        .unwrap_err();
         assert_eq!(err.code(), "storage_error");
         assert_eq!(
             std::fs::read_to_string(&config).unwrap(),
