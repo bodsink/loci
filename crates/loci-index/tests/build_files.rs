@@ -86,6 +86,40 @@ install: build
 \tinstall -m 0755 $(BINARY) $(PREFIX)/bin
 ";
 
+/// GNU Make allows a target named `export`. The grammar only has `export` as
+/// a directive, so without the rewrite this file is `parse_partial` and the
+/// target never reaches the graph — the shape that one real Makefile hit.
+#[test]
+fn a_target_named_export_is_not_reported_as_partial() {
+    let _guard = serial();
+    let root = tempfile::tempdir().expect("temp");
+    write(
+        root.path(),
+        "Makefile",
+        "\
+.PHONY: export
+export:
+\t@mkdir -p data
+",
+    );
+
+    let report = index(root.path(), "build-make-export");
+
+    assert_eq!(
+        report.files_parse_partial, 0,
+        "export: as a target must parse: {:?}",
+        report.parse_partial_examples
+    );
+
+    let found = nodes("build-make-export");
+    assert!(
+        found
+            .iter()
+            .any(|(label, name, _)| *label == NodeLabel::Function && name == "export"),
+        "the target must keep the name export: {found:?}"
+    );
+}
+
 #[test]
 fn a_makefile_is_recognised_without_any_extension() {
     let _guard = serial();

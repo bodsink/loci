@@ -10,7 +10,8 @@ pub mod registry;
 pub mod spec;
 
 pub use dialect::{
-    flatten_conditionals, neutralise_jsx_ampersands, prepare_cpp, separate_keyword_members,
+    flatten_conditionals, neutralise_import_type_arrays, neutralise_jsx_ampersands, prepare_cpp,
+    repair_make_keyword_targets, restore_make_target_names, separate_keyword_members,
 };
 
 pub use extract::{

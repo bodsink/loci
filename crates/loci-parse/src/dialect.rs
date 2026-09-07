@@ -1,6 +1,6 @@
 //! Making sources parseable by grammars that do not quite cover them.
 //!
-//! Four gaps cost real symbols on real repositories:
+//! Six gaps cost real symbols on real repositories:
 //!
 //! 1. tree-sitter-cpp implements C++, not Qt. Qt's moc keywords — `Q_OBJECT`,
 //!    `signals:`, `emit` — are macros that never reach a standards compliant
@@ -13,6 +13,13 @@
 //!    places, and both truncate the file: a `&` in JSX that is not a character
 //!    reference, and an interface member whose name begins with `in` or
 //!    `instanceof` when the members are separated by newlines alone.
+//! 5. The same TypeScript grammar accepts `import('mod').T` as a type in some
+//!    positions, but `import('mod').T[]` is not a `primary_type`, so the `[]`
+//!    becomes a tuple or a subscript and a generic argument is read as a
+//!    comparison. Three files in one project died on that shape alone.
+//! 6. tree-sitter-make treats `export`, `unexport`, `override` and `include` as
+//!    directives, so a target of that name (`export:`) is not a rule. The
+//!    recipe becomes ERROR nodes and the target never reaches the graph.
 //!
 //! All are handled by rewriting the source in place, preserving byte length
 //! exactly, so every offset, line and column the parser reports still points at
@@ -20,6 +27,10 @@
 //! callers keep reading real source from disk. The indexer applies these only
 //! after a direct parse has already failed, and keeps the result only if it
 //! parses better, so a file the grammar already handles is never rewritten.
+//!
+//! The Make pass is the one exception that must restore a name: the keyword
+//! *is* the target, so it is overwritten with underscores of the same length
+//! for the parse and put back from the original bytes afterwards.
 //!
 //! Measured on a Qt project of 94 tracked C/C++ files: 52 files and 187 error
 //! nodes before, 21 files and 66 error nodes after the Qt pass alone. On a
@@ -430,7 +441,7 @@ fn takes_commas(root: tree_sitter::Node, at: usize) -> bool {
     let mut node = root.descendant_for_byte_range(at, at + 1);
     while let Some(current) = node {
         match current.kind() {
-            "object" | "arguments" | "array" => return true,
+            "object" | "arguments" | "array" | "formal_parameters" => return true,
             "interface_body" | "object_type" | "statement_block" | "program" => return false,
             _ => node = current.parent(),
         }
@@ -554,6 +565,190 @@ fn macro_invocation_end(bytes: &[u8], after_name: usize) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+/// Directives the Make grammar will not also accept as a rule target.
+///
+/// Measured by dumping `export:`, `unexport:`, `override:` and `include:` —
+/// each one is parsed as the directive, and the recipe becomes ERROR. A target
+/// that merely *contains* the word (`exports:`) is already a rule.
+const MAKE_TARGET_KEYWORDS: &[&str] = &["export", "unexport", "override", "include"];
+
+/// Turn a directive-keyword used as a target into a word the grammar accepts.
+///
+/// `export:` is a legal Make target. The grammar only has `export` as a
+/// directive, so the line is read as `export` plus a broken assignment and the
+/// recipe never attaches. Replacing the keyword with underscores of the same
+/// length makes it an ordinary `word`, which is a rule. The letters come back
+/// from the original file in [`restore_make_target_names`] — they have to,
+/// because the keyword *is* the name the graph must record.
+///
+/// A real directive is left alone: `export FOO = bar` and a bare `export` are
+/// not followed by `:`, and a recipe line starts with a tab.
+pub fn repair_make_keyword_targets(source: &str) -> Option<String> {
+    let mut out = source.to_string();
+    // Safe because every write is ASCII `_` over an ASCII keyword.
+    let buffer = unsafe { out.as_bytes_mut() };
+    let mut changed = false;
+    let mut offset = 0usize;
+
+    for line in source.split_inclusive('\n') {
+        if let Some(keyword) = keyword_target_on_line(line) {
+            let start = offset + keyword.start;
+            buffer[start..start + keyword.len].fill(b'_');
+            changed = true;
+        }
+        offset += line.len();
+    }
+
+    changed.then_some(out)
+}
+
+struct KeywordTarget {
+    start: usize,
+    len: usize,
+}
+
+/// A line that declares a target whose name is a directive keyword, or `None`.
+fn keyword_target_on_line(line: &str) -> Option<KeywordTarget> {
+    if line.starts_with('\t') {
+        return None;
+    }
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    let rest = &line[indent..];
+    for keyword in MAKE_TARGET_KEYWORDS {
+        let Some(after) = rest.strip_prefix(keyword) else {
+            continue;
+        };
+        // `export:` is the target. `export :=` / `export ::=` are assignments
+        // and already parse as the directive.
+        let Some(after) = after.strip_prefix(':') else {
+            continue;
+        };
+        if after.starts_with('=') {
+            continue;
+        }
+        return Some(KeywordTarget {
+            start: indent,
+            len: keyword.len(),
+        });
+    }
+    None
+}
+
+/// Put back target names that [`repair_make_keyword_targets`] had to overwrite.
+///
+/// The rule node starts at the target word, so `start_byte` plus the dummy
+/// name's length is the original keyword. Qualified names are rebuilt from
+/// that same slice so they stay in lockstep.
+pub fn restore_make_target_names(original: &str, extracted: &mut crate::ExtractedFile) {
+    for definition in &mut extracted.definitions {
+        if !definition.name.bytes().all(|b| b == b'_') {
+            continue;
+        }
+        let end = definition.start_byte + definition.name.len();
+        let Some(original_name) = original.get(definition.start_byte..end) else {
+            continue;
+        };
+        if !MAKE_TARGET_KEYWORDS.contains(&original_name) {
+            continue;
+        }
+        if let Some((prefix, _)) = definition.qualified_name.rsplit_once('.') {
+            definition.qualified_name = format!("{prefix}.{original_name}");
+        } else {
+            definition.qualified_name = original_name.to_string();
+        }
+        definition.name = original_name.to_string();
+    }
+}
+
+/// Replace `import('mod')` in `import('mod').T[]` with a dummy type identifier.
+///
+/// The bundled grammar can read `import('mod').T` as a type in some positions,
+/// but `array_type` only wraps a `primary_type`, and the import form is not
+/// one. The `[]` is then a tuple or a subscript, and `<{ data: import('m').T[] }>`
+/// is read as a comparison — the shape that left three files partial in one
+/// project.
+///
+/// `Foo.Bar[]` already parses, so the import call is overwritten with an
+/// identifier of the same length (`I` plus underscores). The path is a type
+/// query, not an `import_statement`, and is not extracted. `.T` and every
+/// definition around it keep their letters.
+///
+/// `await import('./mod')` and `import('./mod').then(...)` are not followed by
+/// `.Ident[]`, so they are left alone. Which `import` to touch is taken from
+/// the tree: a string or a comment does not produce an `import` node.
+pub fn neutralise_import_type_arrays(language: LanguageId, source: &str) -> Option<String> {
+    if !matches!(
+        language,
+        LanguageId::TypeScript | LanguageId::Tsx | LanguageId::JavaScript | LanguageId::Jsx
+    ) {
+        return None;
+    }
+    if !source.contains("import(") {
+        return None;
+    }
+
+    let grammar = crate::registry::grammar(language)?;
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&grammar).ok()?;
+    let tree = parser.parse(source, None)?;
+
+    let mut spans = Vec::new();
+    collect_import_type_array_spans(tree.root_node(), source, &mut spans);
+    if spans.is_empty() {
+        return None;
+    }
+
+    let mut out = source.to_string();
+    // Safe because every write is ASCII over an ASCII `import(...)` span.
+    let buffer = unsafe { out.as_bytes_mut() };
+    for (start, end) in spans {
+        if end <= start || end > buffer.len() {
+            continue;
+        }
+        buffer[start] = b'I';
+        buffer[start + 1..end].fill(b'_');
+    }
+    Some(out)
+}
+
+fn collect_import_type_array_spans(
+    node: tree_sitter::Node,
+    source: &str,
+    spans: &mut Vec<(usize, usize)>,
+) {
+    if node.kind() == "import" {
+        if let Some(span) = import_call_followed_by_array_type(node, source) {
+            spans.push(span);
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_import_type_array_spans(child, source, spans);
+    }
+}
+
+/// The `import('mod')` span when it is immediately followed by `.Ident[]`.
+fn import_call_followed_by_array_type(
+    import_kw: tree_sitter::Node,
+    source: &str,
+) -> Option<(usize, usize)> {
+    let call = import_kw.parent()?;
+    if call.kind() != "call_expression" {
+        return None;
+    }
+    let rest = source.get(call.end_byte()..)?;
+    let rest = rest.strip_prefix('.')?;
+    let ident_end = rest
+        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '$')
+        .unwrap_or(rest.len());
+    if ident_end == 0 {
+        return None;
+    }
+    rest[ident_end..]
+        .starts_with("[]")
+        .then_some((call.start_byte(), call.end_byte()))
 }
 
 /// Overwrite `[start, end)` with `replacement`, padding to the original length
@@ -1011,6 +1206,30 @@ interface PortStats {
     /// The pass ran file-wide at first and put a semicolon into object
     /// literals that were already correct. The net error count still fell, so
     /// the indexer's guard would have kept the damage.
+
+    /// A parameter named `invoice_category` starts with `in` and is followed
+    /// by `:`, the same shape as a shadowed interface member. Putting a
+    /// semicolon into the parameter list is what left `billingService.ts`
+    /// partial after the import-type pass had already cleared its real errors.
+    #[test]
+    fn a_parameter_named_after_a_keyword_is_left_alone() {
+        let source = "\
+export const getBillings = async (
+  invoice_category: string = '',
+  start_date?: string,
+): Promise<void> => {}
+";
+        assert_eq!(ts_errors(source), 0, "this signature is already correct");
+        assert_eq!(
+            separated(source),
+            None,
+            "a parameter list must not collect a semicolon"
+        );
+    }
+
+    /// The pass ran file-wide at first and put a semicolon into object
+    /// literals that were already correct. The net error count still fell, so
+    /// the indexer's guard would have kept the damage.
     #[test]
     fn an_object_literal_key_named_after_a_keyword_is_left_alone() {
         let source = "\
@@ -1057,6 +1276,153 @@ function f(s: Snapshot) {
             separated("interface A {\n\tin_b: number\n}\n"),
             None,
             "a tab is one byte and cannot hold `; `"
+        );
+    }
+
+    /// Copied from the three files that stayed `parse_partial` after the
+    /// earlier TypeScript passes: an inline `import('…').T[]` inside a type
+    /// argument or a property type.
+    const IMPORT_TYPE_ARRAY: &str = "\
+export const getBillingWhatsAppDeliveries = async (id: string) => {
+  const response = await api.get<{ data: import('@/types').WAMessage[] }>(
+    `/billings/${id}/whatsapp-deliveries`,
+  )
+  return response.data.data ?? []
+}
+
+export interface CreateCategoryRequest {
+  required_fields?: import('@/types/workOrder').WorkOrderCategoryField[]
+}
+
+export function useSearchONUsByCustomerName(q: string) {
+  return useQuery({
+    queryFn: async () => {
+      const res = await api.get<{ data: import('../services/onuService').ONUNameSearchResult[] }>('/onus/search-by-name')
+      return res.data.data ?? []
+    },
+  })
+}
+";
+
+    #[test]
+    fn an_import_type_array_stops_breaking_the_parse() {
+        assert!(
+            ts_errors(IMPORT_TYPE_ARRAY) > 0,
+            "the original must actually fail"
+        );
+
+        let rewritten = neutralise_import_type_arrays(LanguageId::TypeScript, IMPORT_TYPE_ARRAY)
+            .expect("rewritten");
+
+        assert_eq!(
+            rewritten.len(),
+            IMPORT_TYPE_ARRAY.len(),
+            "offsets must not shift"
+        );
+        assert_eq!(
+            rewritten.lines().count(),
+            IMPORT_TYPE_ARRAY.lines().count(),
+            "line numbers must not shift"
+        );
+        assert_eq!(ts_errors(&rewritten), 0, "got {rewritten:?}");
+    }
+
+    /// The functions and the interface are what the graph records. The import
+    /// path is a type query, not a name, and is the only thing allowed to change.
+    #[test]
+    fn import_type_rewrite_keeps_the_symbols_around_it() {
+        let rewritten = neutralise_import_type_arrays(LanguageId::TypeScript, IMPORT_TYPE_ARRAY)
+            .expect("rewritten");
+        let extracted = crate::extract(LanguageId::TypeScript, "s.ts", &rewritten).expect("parse");
+        let names: Vec<&str> = extracted
+            .definitions
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+
+        assert!(names.contains(&"getBillingWhatsAppDeliveries"), "{names:?}");
+        assert!(names.contains(&"CreateCategoryRequest"), "{names:?}");
+        assert!(names.contains(&"useSearchONUsByCustomerName"), "{names:?}");
+        assert!(
+            rewritten.contains("WAMessage") && rewritten.contains("WorkOrderCategoryField"),
+            "the imported type names must survive: {rewritten:?}"
+        );
+    }
+
+    #[test]
+    fn a_runtime_import_is_not_rewritten() {
+        for source in [
+            "const m = await import('./mod')\n",
+            "import('./mod').then(x => x)\n",
+            "import { Foo } from './mod'\n",
+        ] {
+            assert_eq!(ts_errors(source), 0, "precondition: {source:?}");
+            assert_eq!(
+                neutralise_import_type_arrays(LanguageId::TypeScript, source),
+                None,
+                "must leave runtime imports alone: {source:?}"
+            );
+        }
+    }
+
+    /// Taken from `ai-trainer/Makefile`: a target named `export`, which the
+    /// grammar reads as the export directive.
+    const EXPORT_TARGET: &str = "\
+.PHONY: export
+export:
+\t@mkdir -p data
+\tDB_HOST=$(DB_HOST) \\
+\t$(PYTHON) export_training_data.py
+";
+
+    #[test]
+    fn a_target_named_export_stops_breaking_the_parse() {
+        let before = crate::extract(LanguageId::Make, "Makefile", EXPORT_TARGET)
+            .expect("parse")
+            .error_ranges
+            .len();
+        assert!(before > 0, "the original must actually fail");
+
+        let rewritten = repair_make_keyword_targets(EXPORT_TARGET).expect("rewritten");
+
+        assert_eq!(
+            rewritten.len(),
+            EXPORT_TARGET.len(),
+            "offsets must not shift"
+        );
+        assert_eq!(
+            rewritten.lines().count(),
+            EXPORT_TARGET.lines().count(),
+            "line numbers must not shift"
+        );
+
+        let mut extracted =
+            crate::extract(LanguageId::Make, "Makefile", &rewritten).expect("parse");
+        assert_eq!(
+            extracted.error_ranges.len(),
+            0,
+            "rewrite must leave a clean parse: {rewritten:?}"
+        );
+
+        restore_make_target_names(EXPORT_TARGET, &mut extracted);
+        assert!(
+            extracted.definitions.iter().any(|d| d.name == "export"),
+            "the target must keep its name: {:?}",
+            extracted.definitions
+        );
+    }
+
+    #[test]
+    fn a_real_export_directive_is_left_alone() {
+        assert_eq!(
+            repair_make_keyword_targets("export FOO = bar\nexport\nunexport FOO\n"),
+            None,
+            "directives must not be rewritten as targets"
+        );
+        assert_eq!(
+            repair_make_keyword_targets("exports:\n\t@echo ok\n"),
+            None,
+            "a target that merely contains the word is already a rule"
         );
     }
 }

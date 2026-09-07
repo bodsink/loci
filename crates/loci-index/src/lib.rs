@@ -204,28 +204,49 @@ fn extract_best_effort(
         }
     }
 
-    // TypeScript has two places where the lexer takes a keyword over an
-    // identifier. They are independent, and a file can need both, so the
-    // second pass builds on whatever the first produced.
+    // TypeScript has three independent grammar holes. A file can need more
+    // than one, so each pass builds on whatever the last one produced.
     let settled = best.0;
     if !best.1.error_ranges.is_empty() && is_typescript_family(settled) {
-        let markup = loci_parse::neutralise_jsx_ampersands(settled, source);
-        if let Some(markup) = &markup {
-            best = better_of(best, settled, path, markup);
+        let mut prepared: Option<String> = None;
+        if let Some(markup) = loci_parse::neutralise_jsx_ampersands(settled, source) {
+            let before = best.1.error_ranges.len();
+            best = better_of(best, settled, path, &markup);
+            if best.1.error_ranges.len() < before {
+                prepared = Some(markup);
+            }
         }
         if !best.1.error_ranges.is_empty() {
-            let base = markup.as_deref().unwrap_or(source);
+            let base = prepared.as_deref().unwrap_or(source);
             if let Some(separated) = loci_parse::separate_keyword_members(settled, base) {
+                let before = best.1.error_ranges.len();
                 best = better_of(best, settled, path, &separated);
+                if best.1.error_ranges.len() < before {
+                    prepared = Some(separated);
+                }
             }
+        }
+        if !best.1.error_ranges.is_empty() {
+            let base = prepared.as_deref().unwrap_or(source);
+            if let Some(imports) = loci_parse::neutralise_import_type_arrays(settled, base) {
+                best = better_of(best, settled, path, &imports);
+            }
+        }
+    }
+
+    if !best.1.error_ranges.is_empty() && settled == LanguageId::Make {
+        if let Some(repaired) = loci_parse::repair_make_keyword_targets(source) {
+            best = better_of(best, LanguageId::Make, path, &repaired);
+            loci_parse::restore_make_target_names(source, &mut best.1);
         }
     }
 
     Ok(best)
 }
 
-/// Languages that share the tree-sitter-typescript lexer, and so its two
-/// keyword-over-identifier faults. JSX lives in the JavaScript grammars too.
+/// Languages that share the tree-sitter-typescript lexer, and so its
+/// keyword-over-identifier and import-type-array faults. JSX lives in the
+/// JavaScript grammars too.
 fn is_typescript_family(language: LanguageId) -> bool {
     matches!(
         language,

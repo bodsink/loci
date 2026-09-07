@@ -14,9 +14,10 @@ pub use lang::LanguageId;
 pub use sandbox::Sandbox;
 
 /// Bumped whenever the on-disk graph layout changes in a way that makes an
-/// existing store unreadable. Stores tagged with a different version are
-/// reported as needing a re-index instead of being silently misread.
-pub const SCHEMA_VERSION: u32 = 2;
+/// existing store unreadable, or when a parser recovery pass would change
+/// which files are `parse_partial`. Stores tagged with a different version
+/// are fully re-indexed instead of keeping stale coverage records.
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Files above this size are recorded as `skipped` with reason `oversized`
 /// rather than being parsed. Keeps worst-case memory bounded on large repos.

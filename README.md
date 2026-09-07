@@ -18,16 +18,15 @@ Requires a Linux x86_64 machine and a Rust toolchain to build.
 ```bash
 git clone https://github.com/bodsink/loci loci && cd loci
 cargo build --release
-./target/release/loci install
 ```
 
-`install` does two things:
+A release build writes `target/release/loci` and copies it to `~/.local/bin/loci`, which is the
+`loci` on `PATH`. `cargo build` (debug) does not; a crate in `release/deps` does not.
 
-- Copies the binary to `~/.local/bin/loci`, so `loci` works as a command and keeps working after
-  the build directory is cleaned. If `~/.local/bin` is not on your `PATH`, it says so and prints the
-  line to add.
-- Adds a `loci` entry to `~/.cursor/mcp.json`, merging into that file rather than overwriting it:
-  your other MCP servers are preserved and the previous config is backed up.
+`./target/release/loci install` still registers the server in `~/.cursor/mcp.json` (and copies the
+binary if you built on a machine that never produced a release `loci` here). Other MCP servers in
+that file are left alone. If `~/.local/bin` is not on your `PATH`, `install` says so and prints the
+line to add.
 
 Then index a repository and reload MCP servers in Cursor (Settings → MCP → refresh):
 
@@ -42,7 +41,7 @@ Ask the agent something structural — *"what calls `create_order`?"* — and it
 
 | Command | What it does |
 | --- | --- |
-| `loci install` | Copy the binary to `~/.local/bin` and register the server in Cursor's `mcp.json` |
+| `loci install` | Register the server in Cursor's `mcp.json` (and copy the binary if PATH is stale) |
 | `loci index <path>` | Index or re-index a repository (incremental by default, `--full` to force) |
 | `loci status [project]` | Show what is indexed; with no argument, list every project |
 | `loci query --project <id>` | Search the graph for symbols |
@@ -358,12 +357,20 @@ because the total error count still fell, the guard above would have accepted th
 matters is the *nearest* enclosing node, not overlapping spans: an element written inside
 `{cond ? (...) : null}` sits within an expression while still being markup itself.
 
-On a 4269-file Go and React project these passes took `parse_partial` from 33 files to 4, again with
-no change in node count. What they buy is not more symbols but honest ones: a truncated interface
-was still recorded, ending at the member the parse died on, so `get_code_snippet` returned half a
-type. The four that remain are a `Makefile` with a target named `export`, and three files using
-`import('...').T[]` inside a type argument — the same class of grammar fault, left alone rather than
-guessed at.
+On a 4269-file Go and React project the first two TypeScript passes took `parse_partial` from 33
+files to 4. The four that remained were a `Makefile` with a target named `export`, and three files
+using `import('...').T[]` inside a type argument.
+
+`array_type` in the bundled grammar only wraps a `primary_type`, and `import('mod').T` is not one,
+so the `[]` is read as a tuple or a subscript and a generic `<{ data: import('m').T[] }>` becomes a
+comparison. The import call is overwritten with an identifier of the same length; `.T` and every
+definition around it keep their letters. A runtime `import('./mod')` is not followed by `.Ident[]`
+and is left alone.
+
+`export:` is a legal Make target. The grammar only has `export` as a directive, so the recipe
+becomes ERROR nodes. The keyword is replaced with underscores of the same length for the parse, then
+put back from the original bytes so the graph still records a target named `export`. A real
+`export FOO = bar` is not followed by `:` and is not touched.
 
 ## Honest limits
 

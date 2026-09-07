@@ -1,0 +1,7 @@
+# Cargo reads this key itself. `[env] RUSTC_WRAPPER` only forwards an env var
+# into rustc and does not wrap the compiler, so it never copies the binary.
+#
+# The path is relative to the directory that contains `.cargo/` (the
+# workspace root), not to this file.
+[build]
+rustc-wrapper = "scripts/rustc-wrapper.sh"

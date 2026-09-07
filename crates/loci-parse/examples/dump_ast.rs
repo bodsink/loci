@@ -21,11 +21,13 @@ fn main() {
     if rewrite {
         // Applied in turn, each on the output of the last, because a file can
         // need more than one of them.
-        let passes: [fn(LanguageId, &str) -> Option<String>; 4] = [
+        let passes: [fn(LanguageId, &str) -> Option<String>; 6] = [
             |_, s| loci_parse::prepare_cpp(s),
             |_, s| loci_parse::flatten_conditionals(s),
             loci_parse::neutralise_jsx_ampersands,
             loci_parse::separate_keyword_members,
+            loci_parse::neutralise_import_type_arrays,
+            |_, s| loci_parse::repair_make_keyword_targets(s),
         ];
         for pass in passes {
             if let Some(rewritten) = pass(language, &source) {
