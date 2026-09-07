@@ -6,7 +6,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 ROOT = Path(__file__).resolve().parents[1]
-SHOT = ROOT / "docs" / "loci-ui.jpg"
+SHOT = ROOT / "docs" / "loci-ui-atlas.png"
 OUT = ROOT / "docs" / "social-preview.png"
 W, H = 1280, 640
 BG = (7, 7, 12, 255)

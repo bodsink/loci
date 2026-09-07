@@ -22,7 +22,9 @@
 Everything runs on your machine. No cloud, no API key, no language runtime. Your source is read,
 parsed, and left where it is — only structure (names, paths, line ranges, relationships) is stored.
 
-![The Loci web UI showing the call atlas for this repository](docs/loci-ui.jpg)
+![The Loci web UI atlas, call graph of an indexed repository](docs/loci-ui-atlas.png)
+
+![The Loci web UI overview: languages, labels, and index counts](docs/loci-ui-overview.png)
 
 **Status: milestone 1, plus the follow-up work.** Indexing, the graph, all 15 MCP tools, the
 Cursor integration, and a local web UI work today. Hybrid LSP is implemented and off by default;
