@@ -13,7 +13,6 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/bodsink/loci/actions/workflows/ci.yml"><img src="https://github.com/bodsink/loci/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="Apache-2.0">
   <img src="https://img.shields.io/badge/rust-1.88+-orange.svg" alt="Rust 1.88+">
   <img src="https://img.shields.io/badge/platform-Linux%20x86__64-lightgrey.svg" alt="Linux x86_64">
@@ -203,7 +202,7 @@ Every language named for Hybrid LSP is in that list, so no language the engine a
 out to be unparseable. The reverse no longer holds: shell, configuration, build and markup files are
 parsed but have no server in scope, and `hybrid_lsp_eligible` reports false for them.
 `get_graph_schema` reports the list with the upstream crate behind each grammar so it can be
-audited. PHP is out of scope by design and CI fails if it reappears.
+audited. PHP is out of scope by design.
 
 Shell is included because packaging trees are mostly shell: build scripts, and Debian maintainer
 scripts like `postinst` that carry no extension at all. Those are found by their `#!` line, which is
@@ -244,8 +243,7 @@ to check.
   representative per directory and reason, largest group first, with a count of what it stands for,
   so a folder of twenty icons cannot crowd out every other reason a file was left out and the
   biggest gap cannot fall off the end of the list.
-- **Linux x86_64 only.** macOS and Windows are not built or tested; CI covers Linux alone rather
-  than listing platforms it does not verify.
+- **Linux x86_64 only.** macOS and Windows are not built or tested.
 
 ## Performance
 

@@ -11,6 +11,7 @@
 *.swp
 
 # Local Cursor state (plans, rules, chat scratch) stays out of the repo.
-# .github is deliberately NOT ignored: the CI workflow has to be committed for
-# GitHub Actions to run it.
 .cursor
+
+# Keep the Linux CI workflow on this machine only.
+.github/workflows/ci.yml
