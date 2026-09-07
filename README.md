@@ -262,11 +262,34 @@ for a function by that name and found none. It now reads the field as the name a
 as a receiver, which is how ordinary method calls are already resolved. Together these took the
 project from 1 route with a handler edge to 494, and from 0 routes carrying `/v1` to 829.
 
-The remaining 355 Go routes are honest ambiguity rather than a bug. `zoneHandler.List` needs the
-type of `zoneHandler` to pick between the 72 methods named `List` in that repository, and 92 are
-named `Create`. The AST does not carry it, so no edge is written rather than a guessed one; `--lsp`
-is the mechanism for exactly this. A further 215 unlinked "routes" are the frontend's own
-`api.get('/customers')` calls, which are outbound requests with no local handler to point at.
+Middleware sits between the path and the handler — `POST(path, RequirePermission(…), h.Create)` —
+so the handler is the last argument, not the first one after the path.
+
+### Receiver types
+
+Naming the method was not enough. `zoneHandler.List` has to pick between the 72 methods named `List`
+in that repository, and 92 are named `Create`; resolution correctly refused to guess, which left 355
+routes unlinked. What settles it is the type of `zoneHandler`, and the evidence for that is already
+in the source: `zoneHandler := handlers.NewZoneHandler(…)`, and `NewZoneHandler` returns
+`*ZoneHandler`.
+
+Three things make that usable. Go states a method's owning type beside the method rather than around
+it, so the receiver is captured explicitly and the type now appears in the qualified name —
+`…handlers.zone_handler.ZoneHandler.List`. Each local variable is recorded against the function it
+takes its value from, and a variable assigned two different constructors in one file is dropped
+rather than guessed at, since scope is not tracked. And the return type is read from the tree, not
+from `signature`: a stored signature keeps only the first line and caps at 200 characters, so a
+constructor whose parameters span several lines — which is most of them — would lose its type
+entirely.
+
+Resolution by receiver type is tried before any name-based path and is the only one that can
+separate one `List` from 71 others. When the type is unknown, behaviour is unchanged and no edge is
+written. In the project measured here this took Go routes with a handler from 494 to 847 of 849, and
+resolved 359 ordinary method calls that name matching could not settle. The two routes still
+unlinked are inline closures, which have no name to point at.
+
+A further 215 unlinked "routes" are the frontend's own `api.get('/customers')` calls: outbound
+requests with no local handler. Linking those to the backend routes they reach is not done yet.
 
 ### C, C++ and Qt
 

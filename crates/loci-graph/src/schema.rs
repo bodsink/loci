@@ -349,6 +349,16 @@ pub struct FileFacts {
     pub type_relations: Vec<StoredTypeRel>,
     #[serde(default)]
     pub route_links: Vec<StoredRouteLink>,
+    #[serde(default)]
+    pub receiver_bindings: Vec<StoredReceiverBinding>,
+}
+
+/// A local variable and the function it takes its type from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredReceiverBinding {
+    pub variable: String,
+    pub constructor: String,
+    pub file_path: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

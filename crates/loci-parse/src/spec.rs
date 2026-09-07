@@ -164,7 +164,14 @@ static TYPESCRIPT: LanguageSpec = LanguageSpec {
 static GO: LanguageSpec = LanguageSpec {
     definitions: r#"
 (function_declaration name: (identifier) @name) @def.function
-(method_declaration name: (field_identifier) @name) @def.method
+(method_declaration
+  receiver: (parameter_list
+    (parameter_declaration type: (pointer_type (type_identifier) @owner)))
+  name: (field_identifier) @name) @def.method
+(method_declaration
+  receiver: (parameter_list
+    (parameter_declaration type: (type_identifier) @owner))
+  name: (field_identifier) @name) @def.method
 (type_declaration (type_spec name: (type_identifier) @name type: (struct_type))) @def.struct
 (type_declaration (type_spec name: (type_identifier) @name type: (interface_type))) @def.interface
 "#,

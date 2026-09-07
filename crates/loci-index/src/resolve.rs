@@ -1,10 +1,13 @@
-use loci_graph::{Edge, EdgeType, Evidence, Node, NodeLabel, StoredCall};
+use loci_graph::{Edge, EdgeType, Evidence, Node, NodeLabel, StoredCall, StoredReceiverBinding};
 use std::collections::HashMap;
 
 /// How a call edge was established, recorded on the edge so a reader can judge
 /// how much to trust it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resolution {
+    /// The receiver's type is known, and the type owns exactly one method by
+    /// this name.
+    ReceiverType,
     /// Callee defined in the same file.
     SameFile,
     /// Callee defined in the same dotted module prefix.
@@ -16,6 +19,7 @@ pub enum Resolution {
 impl Resolution {
     const fn detail(self) -> &'static str {
         match self {
+            Self::ReceiverType => "receiver_type_match",
             Self::SameFile => "same_file_name_match",
             Self::SameModule => "same_module_name_match",
             Self::UniqueInProject => "unique_callable_name_in_project",
@@ -24,6 +28,10 @@ impl Resolution {
 
     const fn confidence(self) -> f32 {
         match self {
+            // Naming the owning type is what the name-only paths below cannot
+            // do; it is the difference between one method and the 72 others
+            // that happen to be called `List`.
+            Self::ReceiverType => 1.0,
             Self::SameFile => 1.0,
             Self::SameModule => 0.9,
             // A project-wide unique name is strong evidence but not proof; the
@@ -45,6 +53,12 @@ pub struct SymbolTable {
     by_module_and_name: HashMap<(String, String), Vec<Candidate>>,
     /// simple_name -> candidates, across the whole project
     by_name: HashMap<String, Vec<Candidate>>,
+    /// (owning type, method name) -> method node ids
+    by_owner_and_name: HashMap<(String, String), Vec<u64>>,
+    /// function name -> the type it returns, read from its own signature
+    returns: HashMap<String, Option<String>>,
+    /// (file, variable) -> the type that variable holds
+    receiver_types: HashMap<(String, String), String>,
 }
 
 /// How a call was written at the call site.
@@ -96,6 +110,16 @@ fn pick(candidates: &[Candidate], shape: CallShape) -> Option<u64> {
     }
 }
 
+/// The type a method hangs off: the segment before its own name.
+///
+/// Works the same for `pkg.ZoneHandler.List` and Python's `mod.Cls.method`,
+/// because both spell containment the same way once the name is qualified.
+fn owner_of(qualified_name: &str) -> Option<&str> {
+    let mut segments = qualified_name.rsplit('.');
+    segments.next()?;
+    segments.next().filter(|owner| !owner.is_empty())
+}
+
 fn module_of(qualified_name: &str, own_name: &str) -> String {
     qualified_name
         .strip_suffix(own_name)
@@ -110,6 +134,9 @@ impl SymbolTable {
             by_file_and_name: HashMap::new(),
             by_module_and_name: HashMap::new(),
             by_name: HashMap::new(),
+            by_owner_and_name: HashMap::new(),
+            returns: HashMap::new(),
+            receiver_types: HashMap::new(),
         };
 
         for node in nodes {
@@ -120,6 +147,29 @@ impl SymbolTable {
             if !node.label.is_callable() {
                 continue;
             }
+
+            if node.label == NodeLabel::Method {
+                if let Some(owner) = owner_of(&node.qualified_name) {
+                    table
+                        .by_owner_and_name
+                        .entry((owner.to_string(), node.name.clone()))
+                        .or_default()
+                        .push(node.id);
+                }
+            }
+
+            // A name assigned two different return types is no evidence at all,
+            // so it is recorded as unusable rather than as the last one seen.
+            let returns = node.extra.get("returns").cloned();
+            table
+                .returns
+                .entry(node.name.clone())
+                .and_modify(|known| {
+                    if known.as_deref() != returns.as_deref() {
+                        *known = None;
+                    }
+                })
+                .or_insert(returns);
             let candidate = (node.id, node.label == NodeLabel::Method);
             table
                 .by_file_and_name
@@ -146,6 +196,76 @@ impl SymbolTable {
 
     pub fn node_id_for_qualified_name(&self, qualified_name: &str) -> Option<u64> {
         self.by_qualified_name.get(qualified_name).copied()
+    }
+
+    /// The type a constructor hands back, for typing the variable it fills.
+    pub fn return_type_of(&self, function_name: &str) -> Option<&str> {
+        self.returns.get(function_name)?.as_deref()
+    }
+
+    /// Give each bound variable the type its constructor returns.
+    ///
+    /// Runs after the table is built because it reads the signatures the build
+    /// collected. A binding whose constructor is not in this project — a
+    /// third-party client, say — types nothing, and its calls fall back to
+    /// resolution by name.
+    pub fn learn_receiver_bindings(&mut self, bindings: &[StoredReceiverBinding]) {
+        for binding in bindings {
+            let Some(type_name) = self.return_type_of(&binding.constructor) else {
+                continue;
+            };
+            self.receiver_types.insert(
+                (binding.file_path.clone(), binding.variable.clone()),
+                type_name.to_string(),
+            );
+        }
+    }
+
+    /// The type a variable holds at a given file, if it is known.
+    pub fn receiver_type(&self, file: &str, variable: &str) -> Option<&str> {
+        self.receiver_types
+            .get(&(file.to_string(), variable.to_string()))
+            .map(String::as_str)
+    }
+
+    /// Resolve a call, using the receiver's type when that type is known.
+    ///
+    /// Type-directed resolution is tried first because it is the only path that
+    /// can separate one `List` from the 72 others in a repository. When the
+    /// type is unknown the behaviour is exactly as before.
+    pub fn resolve_call_with_receiver(
+        &self,
+        callee_name: &str,
+        from_file: &str,
+        from_qualified_name: &str,
+        receiver: Option<&str>,
+    ) -> Option<(u64, Resolution)> {
+        if let Some(type_name) = receiver.and_then(|name| self.receiver_type(from_file, name)) {
+            if let Some(id) = self.resolve_method_on_type(type_name, callee_name) {
+                return Some((id, Resolution::ReceiverType));
+            }
+        }
+        self.resolve_call(
+            callee_name,
+            from_file,
+            from_qualified_name,
+            CallShape::of(receiver),
+        )
+    }
+
+    /// The one method a named type owns by this name.
+    ///
+    /// A type declaring the same method twice is a build error in Go, so more
+    /// than one candidate means the owner was misread, and nothing is returned.
+    pub fn resolve_method_on_type(&self, type_name: &str, method: &str) -> Option<u64> {
+        match self
+            .by_owner_and_name
+            .get(&(type_name.to_string(), method.to_string()))?
+            .as_slice()
+        {
+            [only] => Some(*only),
+            _ => None,
+        }
     }
 
     /// Resolve a callee name seen inside `from_qualified_name`.
@@ -241,11 +361,11 @@ pub fn build_call_edges(
         };
         let shape = CallShape::of(site.receiver.as_deref());
 
-        let mut edge = match table.resolve_call(
+        let mut edge = match table.resolve_call_with_receiver(
             &site.callee_name,
             &site.file_path,
             &site.from_qualified_name,
-            shape,
+            site.receiver.as_deref(),
         ) {
             Some((dst, resolution)) if dst != src => {
                 let mut edge = Edge::new(src, dst, EdgeType::Calls);
@@ -311,6 +431,15 @@ pub fn is_call_owner(label: NodeLabel) -> bool {
 mod tests {
     use super::*;
     use loci_core::LanguageId;
+
+    #[test]
+    fn an_owner_is_the_segment_before_the_name() {
+        assert_eq!(
+            owner_of("internal.handlers.zone.ZoneHandler.List"),
+            Some("ZoneHandler")
+        );
+        assert_eq!(owner_of("List"), None);
+    }
 
     fn callable(id: u64, name: &str, qn: &str, file: &str) -> Node {
         let mut node = Node::new(

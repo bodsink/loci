@@ -244,6 +244,57 @@ func main() {
         assert_eq!(health.handler_receiver, None);
     }
 
+    /// The return type has to come from the tree, not from `signature`. Most
+    /// constructors in a real service spread their parameters over several
+    /// lines, and `signature` keeps only the first — which for those is
+    /// `func NewInventoryHandler(`, with the type nowhere in it.
+    #[test]
+    fn a_constructor_reports_the_type_it_returns() {
+        let source = r#"
+package handlers
+
+func NewZoneHandler(db *gorm.DB) *ZoneHandler { return nil }
+
+func NewInventoryHandler(
+	repo *repository.InventoryRepository,
+	audit *helpers.AuditLogHelper,
+) *InventoryHandler {
+	return nil
+}
+
+func NewClient(dsn string) (*Client, error) { return nil, nil }
+
+func NewStore(db *DB) Store { return nil }
+
+func Run(addr string) error { return nil }
+
+func Open(dsn string) *gorm.DB { return nil }
+
+func Names() []string { return nil }
+"#;
+        let out = extract(LanguageId::Go, "internal/handlers/new.go", source).unwrap();
+        let returns: Vec<(&str, Option<&str>)> = out
+            .definitions
+            .iter()
+            .map(|d| (d.name.as_str(), d.returns.as_deref()))
+            .collect();
+
+        assert_eq!(
+            returns,
+            vec![
+                ("NewZoneHandler", Some("ZoneHandler")),
+                ("NewInventoryHandler", Some("InventoryHandler")),
+                // The error alongside it is not what the variable is used as.
+                ("NewClient", Some("Client")),
+                ("NewStore", Some("Store")),
+                // Nothing below names a type this project owns methods on.
+                ("Run", None),
+                ("Open", None),
+                ("Names", None),
+            ]
+        );
+    }
+
     #[test]
     fn rust_items_and_impl_methods() {
         let source = r#"

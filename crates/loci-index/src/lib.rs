@@ -18,8 +18,8 @@ use loci_graph::{
     catalog::{Catalog, ProjectEntry},
     coverage::COVERAGE_NOTE,
     CoverageReason, CoverageStatus, Edge, EdgeType, Evidence, FileFacts, FileRecord, GraphStore,
-    Node, NodeLabel, ProjectMeta, StoredCall, StoredImport, StoredRouteLink, StoredTypeRel,
-    STRUCTURAL_EDGE_ID_BASE,
+    Node, NodeLabel, ProjectMeta, StoredCall, StoredImport, StoredReceiverBinding, StoredRouteLink,
+    StoredTypeRel, STRUCTURAL_EDGE_ID_BASE,
 };
 use rayon::prelude::*;
 use resolve::SymbolTable;
@@ -719,6 +719,9 @@ fn write_file_symbols(
         node.id = *next_node_id;
         *next_node_id += 1;
         node.signature = definition.signature.clone();
+        if let Some(returns) = &definition.returns {
+            node.extra.insert("returns".to_string(), returns.clone());
+        }
         node.source = Evidence::Ast;
         writer.put_node(&node)?;
         node_ids.push(node.id);
@@ -840,6 +843,16 @@ fn write_file_symbols(
         })
         .collect();
 
+    let receiver_bindings = extracted
+        .receiver_bindings
+        .iter()
+        .map(|binding| StoredReceiverBinding {
+            variable: binding.variable.clone(),
+            constructor: binding.constructor.clone(),
+            file_path: outcome.relative_path.clone(),
+        })
+        .collect();
+
     writer.put_file_facts(
         &outcome.relative_path,
         &FileFacts {
@@ -847,6 +860,7 @@ fn write_file_symbols(
             imports,
             type_relations,
             route_links,
+            receiver_bindings,
         },
     )?;
 
@@ -1214,7 +1228,7 @@ fn rebuild_resolved_edges(
 
     // Resolution always consults the whole project's symbols; only the set of
     // facts being resolved narrows.
-    let table = SymbolTable::build(&nodes);
+    let mut table = SymbolTable::build(&nodes);
     phase_ms.load_facts = phase_started.elapsed().as_millis() as u64;
     let phase_started = Instant::now();
 
@@ -1241,6 +1255,9 @@ fn rebuild_resolved_edges(
                 facts
                     .route_links
                     .extend(file_facts.route_links.iter().cloned());
+                facts
+                    .receiver_bindings
+                    .extend(file_facts.receiver_bindings.iter().cloned());
             }
         }
         Some(paths) => {
@@ -1256,9 +1273,20 @@ fn rebuild_resolved_edges(
                 facts
                     .route_links
                     .extend(file_facts.route_links.iter().cloned());
+                facts
+                    .receiver_bindings
+                    .extend(file_facts.receiver_bindings.iter().cloned());
             }
         }
     }
+
+    // Bindings come from every file, not just the affected ones: a variable
+    // typed in an untouched file still types the calls made through it here.
+    let all_bindings: Vec<StoredReceiverBinding> = facts_by_file
+        .values()
+        .flat_map(|file_facts| file_facts.receiver_bindings.iter().cloned())
+        .collect();
+    table.learn_receiver_bindings(&all_bindings);
 
     let file_node_by_path: HashMap<String, u64> = nodes
         .iter()
@@ -1349,11 +1377,11 @@ fn rebuild_resolved_edges(
         };
         // A handler written `h.Login` is a method call in every respect but the
         // parentheses, so it is resolved as one.
-        let Some((dst, _)) = table.resolve_call(
+        let Some((dst, _)) = table.resolve_call_with_receiver(
             &link.handler_name,
             &link.file_path,
             &link.route_qualified_name,
-            resolve::CallShape::of(link.handler_receiver.as_deref()),
+            link.handler_receiver.as_deref(),
         ) else {
             continue;
         };

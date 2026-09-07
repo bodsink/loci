@@ -17,6 +17,13 @@ pub struct Definition {
     pub start_byte: usize,
     pub end_byte: usize,
     pub signature: Option<String>,
+    /// Project type this returns, when it returns exactly one nameable type.
+    ///
+    /// Read from the tree rather than from `signature`, which keeps only the
+    /// first line and caps at 200 characters — a constructor whose parameters
+    /// span several lines would otherwise lose its return type entirely, and
+    /// that is how most of them are written.
+    pub returns: Option<String>,
 }
 
 /// A call site. The callee is a *name as written*; resolution happens later.
@@ -78,6 +85,18 @@ pub struct RouteDef {
     pub framework_hint: String,
 }
 
+/// A local variable that takes its type from what a function returns.
+///
+/// `zoneHandler := handlers.NewZoneHandler(…)` says nothing about a type on its
+/// own, but the constructor's signature does, and that signature is already in
+/// the graph. This is what lets `zoneHandler.List` pick one method out of the
+/// 72 named `List`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReceiverBinding {
+    pub variable: String,
+    pub constructor: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ExtractedFile {
     pub definitions: Vec<Definition>,
@@ -85,6 +104,7 @@ pub struct ExtractedFile {
     pub imports: Vec<ImportRef>,
     pub type_relations: Vec<TypeRel>,
     pub routes: Vec<RouteDef>,
+    pub receiver_bindings: Vec<ReceiverBinding>,
     /// Inclusive 1-based line ranges the parser could not understand.
     pub error_ranges: Vec<(u32, u32)>,
 }
@@ -161,6 +181,63 @@ fn signature_of(node: TsNode, source: &str) -> Option<String> {
     let trimmed = first.trim_end_matches(['{', ':']).trim();
     let capped: String = trimmed.chars().take(200).collect();
     (!capped.is_empty()).then_some(capped)
+}
+
+/// The single project type a declaration returns, read from its `result`.
+///
+/// A type from another package is spelled `qualified_type` and is deliberately
+/// not returned: its methods are not this project's to claim. Slices, maps and
+/// builtins own no methods here either, so they yield nothing rather than a
+/// name that would match the wrong thing.
+fn returns_of(node: TsNode, source: &str) -> Option<String> {
+    const BUILTIN: &[&str] = &[
+        "error",
+        "string",
+        "bool",
+        "byte",
+        "rune",
+        "any",
+        "int",
+        "int8",
+        "int16",
+        "int32",
+        "int64",
+        "uint",
+        "uint8",
+        "uint16",
+        "uint32",
+        "uint64",
+        "float32",
+        "float64",
+        "complex64",
+        "complex128",
+        "uintptr",
+    ];
+
+    fn named_type(node: TsNode, source: &str) -> Option<String> {
+        match node.kind() {
+            "type_identifier" => Some(text(node, source).to_string()),
+            "pointer_type" | "parenthesized_type" => {
+                let mut cursor = node.walk();
+                let children: Vec<TsNode> = node.named_children(&mut cursor).collect();
+                children
+                    .into_iter()
+                    .find_map(|child| named_type(child, source))
+            }
+            // Multiple results: the first is what the variable is used as, and
+            // the rest are conventionally an error.
+            "parameter_list" => {
+                let mut cursor = node.walk();
+                let first = node.named_children(&mut cursor).next()?;
+                named_type(first, source)
+            }
+            "parameter_declaration" => named_type(node.child_by_field_name("type")?, source),
+            _ => None,
+        }
+    }
+
+    let named = named_type(node.child_by_field_name("result")?, source)?;
+    (!BUILTIN.contains(&named.as_str())).then_some(named)
 }
 
 fn has_ancestor_of_kind(node: TsNode, kinds: &[&str]) -> bool {
@@ -248,6 +325,12 @@ pub fn extract(language: LanguageId, relative_path: &str, source: &str) -> Resul
     if language == LanguageId::Html {
         extract_html(&mut extracted, root, source, relative_path, &prefix);
     }
+    // Go is the only language here that both hides the receiver type behind a
+    // constructor and names methods without their type, so it is the only one
+    // that needs the binding to resolve a receiver.
+    if language == LanguageId::Go {
+        extract_receiver_bindings(&mut extracted, root, source);
+    }
     extract_routes(&mut extracted, &grammar, spec, root, source, language)?;
 
     Ok(extracted)
@@ -269,11 +352,15 @@ fn extract_definitions(
     struct Raw {
         label: NodeLabel,
         name: String,
+        /// Type this definition hangs off when the grammar states it beside the
+        /// definition rather than around it — a Go method's receiver.
+        owner: Option<String>,
         start_line: u32,
         end_line: u32,
         start_byte: usize,
         end_byte: usize,
         signature: Option<String>,
+        returns: Option<String>,
     }
 
     let capture_names = query.capture_names();
@@ -285,11 +372,14 @@ fn extract_definitions(
         let mut label: Option<NodeLabel> = None;
         let mut def_node: Option<TsNode> = None;
         let mut name_node: Option<TsNode> = None;
+        let mut owner_node: Option<TsNode> = None;
 
         for capture in m.captures {
             let capture_name = capture_names[capture.index as usize];
             if capture_name == "name" {
                 name_node = Some(capture.node);
+            } else if capture_name == "owner" {
+                owner_node = Some(capture.node);
             } else if let Some(l) = spec::label_for_capture(capture_name) {
                 label = Some(l);
                 def_node = Some(capture.node);
@@ -309,11 +399,13 @@ fn extract_definitions(
         raws.push(Raw {
             label,
             name: text(name_node, source).to_string(),
+            owner: owner_node.map(|node| text(node, source).to_string()),
             start_line: line_of(def_node),
             end_line: end_line_of(def_node),
             start_byte: def_node.start_byte(),
             end_byte: def_node.end_byte(),
             signature: signature_of(def_node, source),
+            returns: returns_of(def_node, source),
         });
     }
 
@@ -338,6 +430,13 @@ fn extract_definitions(
             parts.push(prefix);
         }
         parts.extend(chain);
+        // Go states the owning type beside the method rather than around it, so
+        // it never appears in the enclosure chain. Without it every `List` in a
+        // repository shares one name — 72 of them in the project measured here,
+        // and 92 called `Create` — and no receiver can pick between them.
+        if let Some(owner) = &raws[i].owner {
+            parts.push(owner);
+        }
         parts.push(&raws[i].name);
 
         out.definitions.push(Definition {
@@ -349,6 +448,7 @@ fn extract_definitions(
             start_byte: raws[i].start_byte,
             end_byte: raws[i].end_byte,
             signature: raws[i].signature.clone(),
+            returns: raws[i].returns.clone(),
         });
     }
 
@@ -565,6 +665,7 @@ fn extract_html(
                     start_byte: node.start_byte(),
                     end_byte: node.end_byte(),
                     signature: None,
+                    returns: None,
                 });
             } else if links && matches!(name.as_str(), "src" | "href") {
                 if let Some(target) = shipped_asset(relative_path, value) {
@@ -850,26 +951,8 @@ fn extract_routes(
 /// way simply has no prefix, which leaves the path exactly as it was before.
 fn group_prefixes(root: TsNode, source: &str) -> BTreeMap<String, String> {
     let mut prefixes: BTreeMap<String, String> = BTreeMap::new();
-    let mut stack = vec![root];
 
-    // Pre-order, children left to right, which is source order for statements.
-    let mut ordered = Vec::new();
-    while let Some(node) = stack.pop() {
-        ordered.push(node);
-        let mut cursor = node.walk();
-        let children: Vec<TsNode> = node.named_children(&mut cursor).collect();
-        for child in children.into_iter().rev() {
-            stack.push(child);
-        }
-    }
-
-    for node in ordered {
-        if !matches!(
-            node.kind(),
-            "short_var_declaration" | "assignment_statement" | "variable_declaration"
-        ) {
-            continue;
-        }
+    for node in assignments(root) {
         let (Some(left), Some(right)) = (
             node.child_by_field_name("left"),
             node.child_by_field_name("right"),
@@ -889,6 +972,76 @@ fn group_prefixes(root: TsNode, source: &str) -> BTreeMap<String, String> {
     }
 
     prefixes
+}
+
+/// Assignments in source order, so a value is read before anything built on it.
+fn assignments(root: TsNode) -> Vec<TsNode> {
+    let mut stack = vec![root];
+    let mut ordered = Vec::new();
+    while let Some(node) = stack.pop() {
+        if matches!(
+            node.kind(),
+            "short_var_declaration" | "assignment_statement" | "variable_declaration"
+        ) {
+            ordered.push(node);
+        }
+        let mut cursor = node.walk();
+        let children: Vec<TsNode> = node.named_children(&mut cursor).collect();
+        for child in children.into_iter().rev() {
+            stack.push(child);
+        }
+    }
+    ordered
+}
+
+/// Record which function each local variable takes its type from.
+///
+/// A variable that is assigned twice in one file is dropped rather than
+/// guessed at: scope is not tracked here, so two functions each declaring their
+/// own `h` are indistinguishable, and a wrong receiver is worse than none.
+fn extract_receiver_bindings(out: &mut ExtractedFile, root: TsNode, source: &str) {
+    let mut seen: BTreeMap<String, Option<String>> = BTreeMap::new();
+
+    for node in assignments(root) {
+        let (Some(left), Some(right)) = (
+            node.child_by_field_name("left"),
+            node.child_by_field_name("right"),
+        ) else {
+            continue;
+        };
+        let Some(variable) = first_identifier(left, source) else {
+            continue;
+        };
+        let Some(call) = find_call_expression(right) else {
+            continue;
+        };
+        let Some(function) = call.child_by_field_name("function") else {
+            continue;
+        };
+        // `NewZoneHandler(…)` and `handlers.NewZoneHandler(…)` name the same
+        // function; the package qualifier is not part of its name in the graph.
+        let constructor = handler_reference(function, source).name;
+
+        match seen.get(&variable) {
+            Some(Some(existing)) if existing != &constructor => {
+                seen.insert(variable, None);
+            }
+            Some(None) => {}
+            _ => {
+                seen.insert(variable, Some(constructor));
+            }
+        }
+    }
+
+    out.receiver_bindings = seen
+        .into_iter()
+        .filter_map(|(variable, constructor)| {
+            Some(ReceiverBinding {
+                variable,
+                constructor: constructor?,
+            })
+        })
+        .collect();
 }
 
 /// Read `parent.Group("/prefix")`, returning the parent and the literal prefix.
@@ -1018,29 +1171,32 @@ fn handler_from_arguments(source: &str, path_node: TsNode) -> (Option<HandlerRef
         return (None, None);
     };
     let mut cursor = args.walk();
-    let mut seen_path = false;
+    let children: Vec<TsNode> = args.named_children(&mut cursor).collect();
+    let Some(path_at) = children.iter().position(|c| c.id() == path_node.id()) else {
+        return (None, None);
+    };
+    let after = &children[path_at + 1..];
 
-    for child in args.named_children(&mut cursor) {
-        if child.id() == path_node.id() {
-            seen_path = true;
-            continue;
-        }
-        if !seen_path {
-            continue;
-        }
-
-        if let Some((verb, handler)) = verb_wrapped_handler(child, source) {
+    // A verb wrapper such as axum's `get(handler)` names both the verb and the
+    // handler, so it wins wherever it sits.
+    for child in after {
+        if let Some((verb, handler)) = verb_wrapped_handler(*child, source) {
             return (Some(handler), Some(verb));
         }
-        // A closure is a handler with no name to link to; the route still
-        // stands on its own.
-        if child.kind().contains("func_literal") || child.kind().contains("closure") {
-            return (None, None);
-        }
-        return (Some(handler_reference(child, source)), None);
     }
 
-    (None, None)
+    // Otherwise the handler is the last argument. Everything between it and the
+    // path is middleware — `POST(path, RequirePermission(…), h.Create)` — and
+    // reading the first argument instead pointed 8 routes at their rate limiter.
+    let Some(last) = after.last() else {
+        return (None, None);
+    };
+    // A closure is a handler with no name to link to; the route still stands on
+    // its own.
+    if last.kind().contains("func_literal") || last.kind().contains("closure") {
+        return (None, None);
+    }
+    (Some(handler_reference(*last, source)), None)
 }
 
 /// Recognise `get(handler)` / `post(handler)` style wrappers.

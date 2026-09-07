@@ -256,6 +256,164 @@ func doLogin(c *gin.Context) {}
     assert_eq!(route_paths("routes-middleware"), vec!["/v1/auth/login"]);
 }
 
+/// The ambiguity that name matching cannot survive, and the reason receiver
+/// types exist: two handlers, one method name, one right answer each.
+///
+/// In the project this was measured on, 92 methods are named `Create` and 72
+/// `List`. Before the receiver's type was known, every one of those routes went
+/// unlinked rather than guessed at.
+#[test]
+fn two_types_sharing_a_method_name_each_get_their_own_route() {
+    let _guard = serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    write(dir.path(), "go.mod", "module example.com/svc\n\ngo 1.21\n");
+    write(
+        dir.path(),
+        "internal/handlers/zone.go",
+        r#"package handlers
+
+type ZoneHandler struct{}
+
+func NewZoneHandler(db *gorm.DB) *ZoneHandler { return &ZoneHandler{} }
+
+func (h *ZoneHandler) List(c *gin.Context) {}
+"#,
+    );
+    write(
+        dir.path(),
+        "internal/handlers/invoice.go",
+        r#"package handlers
+
+type InvoiceHandler struct{}
+
+func NewInvoiceHandler(db *gorm.DB) *InvoiceHandler { return &InvoiceHandler{} }
+
+func (h *InvoiceHandler) List(c *gin.Context) {}
+"#,
+    );
+    write(
+        dir.path(),
+        "cmd/server/main.go",
+        r#"package main
+
+func main() {
+	router := gin.Default()
+	zoneHandler := handlers.NewZoneHandler(db)
+	invoiceHandler := handlers.NewInvoiceHandler(db)
+
+	v1 := router.Group("/v1")
+	v1.GET("/zones", zoneHandler.List)
+	v1.GET("/invoices", invoiceHandler.List)
+}
+"#,
+    );
+    index(dir.path(), "routes-ambiguous");
+
+    let (_, store) = loci_index::open_project("routes-ambiguous").expect("open");
+    let reader = store.read().expect("read");
+    let nodes = reader.all_nodes().expect("nodes");
+    let by_id: BTreeMap<u64, &loci_graph::Node> = nodes.iter().map(|n| (n.id, n)).collect();
+
+    let mut linked: Vec<(String, String)> = reader
+        .all_edges()
+        .expect("edges")
+        .iter()
+        .filter(|e| e.edge_type == EdgeType::RoutesTo)
+        .filter_map(|e| {
+            let route = by_id.get(&e.src)?;
+            let handler = by_id.get(&e.dst)?;
+            Some((route.name.clone(), handler.qualified_name.clone()))
+        })
+        .collect();
+    linked.sort();
+
+    assert_eq!(
+        linked,
+        vec![
+            (
+                "/v1/invoices".to_string(),
+                "internal.handlers.invoice.InvoiceHandler.List".to_string()
+            ),
+            (
+                "/v1/zones".to_string(),
+                "internal.handlers.zone.ZoneHandler.List".to_string()
+            ),
+        ],
+        "each route must reach its own type's List, not the other's"
+    );
+}
+
+/// A receiver whose type cannot be established resolves nothing rather than
+/// picking one of two identical names.
+#[test]
+fn an_unknown_receiver_type_links_nothing() {
+    let _guard = serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    write(dir.path(), "go.mod", "module example.com/svc\n\ngo 1.21\n");
+    write(
+        dir.path(),
+        "internal/handlers/zone.go",
+        "package handlers\n\ntype ZoneHandler struct{}\n\n\
+         func (h *ZoneHandler) List(c *gin.Context) {}\n",
+    );
+    write(
+        dir.path(),
+        "internal/handlers/invoice.go",
+        "package handlers\n\ntype InvoiceHandler struct{}\n\n\
+         func (h *InvoiceHandler) List(c *gin.Context) {}\n",
+    );
+    write(
+        dir.path(),
+        "cmd/server/main.go",
+        r#"package main
+
+func main() {
+	router := gin.Default()
+	handler := external.Build()
+	router.GET("/zones", handler.List)
+}
+"#,
+    );
+    index(dir.path(), "routes-unknown-type");
+
+    assert_eq!(route_paths("routes-unknown-type"), vec!["/zones"]);
+    assert!(
+        handled("routes-unknown-type").is_empty(),
+        "two types own a List and nothing says which; no edge beats a wrong one"
+    );
+}
+
+/// Middleware sits between the path and the handler, and the handler is last.
+/// Reading the first argument instead pointed routes at their rate limiter.
+#[test]
+fn middleware_between_path_and_handler_is_not_the_handler() {
+    let _guard = serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    write(dir.path(), "go.mod", "module example.com/svc\n\ngo 1.21\n");
+    write(
+        dir.path(),
+        "main.go",
+        r#"package main
+
+func main() {
+	router := gin.Default()
+	v1 := router.Group("/v1")
+	v1.GET("/queue", middleware.RequirePermission(rbacRepo, "read"), listQueue)
+}
+
+func listQueue(c *gin.Context) {}
+
+func RequirePermission(repo *Repo, name string) gin.HandlerFunc { return nil }
+"#,
+    );
+    index(dir.path(), "routes-middleware-arg");
+
+    assert_eq!(
+        handled("routes-middleware-arg"),
+        vec![("/v1/queue".to_string(), "listQueue".to_string())]
+    );
+}
+
 /// Express keeps working: a bare function handler and no groups.
 #[test]
 fn an_express_route_still_resolves_its_handler() {

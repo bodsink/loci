@@ -14,8 +14,8 @@ pub mod store;
 pub use catalog::{Catalog, ProjectEntry};
 pub use schema::{
     CoverageReason, CoverageStatus, Edge, EdgeType, Evidence, FileFacts, FileRecord, Node,
-    NodeLabel, ProjectMeta, StoredCall, StoredImport, StoredRouteLink, StoredTypeRel,
-    STRUCTURAL_EDGE_ID_BASE, UNRESOLVED_NODE_ID,
+    NodeLabel, ProjectMeta, StoredCall, StoredImport, StoredReceiverBinding, StoredRouteLink,
+    StoredTypeRel, STRUCTURAL_EDGE_ID_BASE, UNRESOLVED_NODE_ID,
 };
 pub use store::{GraphReader, GraphStore, GraphWriter};
 
