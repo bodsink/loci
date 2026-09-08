@@ -37,6 +37,11 @@ pub fn agent_journal_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("agent_calls.jsonl"))
 }
 
+/// PID of the `loci ui` process that last bound successfully.
+pub fn ui_pid_path() -> Result<PathBuf> {
+    Ok(data_dir()?.join("ui.pid"))
+}
+
 pub fn project_store_dir(project_id: &str) -> Result<PathBuf> {
     Ok(projects_dir()?.join(project_id))
 }

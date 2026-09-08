@@ -1469,7 +1469,7 @@ fn open_project_with(
     open: fn(&Path) -> Result<GraphStore>,
 ) -> Result<(ProjectEntry, GraphStore)> {
     let catalog = Catalog::load()?;
-    let entry = catalog.require(project_id)?.clone();
+    let entry = catalog.resolve(project_id)?.clone();
     let path = Path::new(&entry.store_path);
     if !path.exists() {
         return Err(LociError::IndexMissing(project_id.to_string()));

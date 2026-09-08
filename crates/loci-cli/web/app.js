@@ -44,6 +44,9 @@ const state = {
   trace: null,
   coverage: null,
   changes: null,
+  usage: null,
+  usageWindow: "day",
+  surface: "performance",
   graphView: "calls",
   graphSeed: "",
 };
@@ -93,6 +96,9 @@ async function loadProjects() {
   const data = await apiTool("list_projects", { limit: 200 });
   state.projects = data.projects || [];
   renderProjects();
+  if (state.surface === "performance") {
+    return;
+  }
   if (!state.project && state.projects.length) {
     await selectProject(state.projects[0].project);
   } else if (state.project) {
@@ -106,11 +112,20 @@ async function loadProjects() {
   }
 }
 
+function setSurface(name) {
+  state.surface = name;
+  const perf = $("nav-performance");
+  if (perf) perf.classList.toggle("active", name === "performance");
+  $("tabs").hidden = name === "performance";
+  const search = $("global-search");
+  if (search && search.parentElement) search.parentElement.hidden = name === "performance";
+}
+
 function renderProjects() {
   $("projects").innerHTML = state.projects
     .map(
       (p) => `
-      <div class="project-row ${p.project === state.project ? "active" : ""}">
+      <div class="project-row ${state.surface === "project" && p.project === state.project ? "active" : ""}">
         <button class="project" type="button" data-id="${esc(p.project)}">
           <b>${esc(p.name || p.project)}</b>
           <small>${esc(p.root)}</small>
@@ -130,15 +145,29 @@ function renderProjects() {
   });
 }
 
+async function openPerformance() {
+  setSurface("performance");
+  state.tab = "usage";
+  $("project-title").textContent = "Day performance";
+  $("project-root").textContent = "MCP tool calls across every indexed project.";
+  $("reindex").hidden = true;
+  $("delete-project").hidden = true;
+  renderProjects();
+  $("workspace").innerHTML = `<div class="empty">Loading day performance…</div>`;
+  await loadUsage();
+  renderWorkspace();
+}
+
 async function selectProject(id) {
   if (!id) {
-    $("project-title").textContent = "Select a project";
-    $("project-root").textContent = "Index a repository to see its graph.";
-    $("reindex").hidden = true;
-    $("delete-project").hidden = true;
-    renderWorkspace();
+    await openPerformance();
     return;
   }
+  setSurface("project");
+  if (state.tab === "usage") state.tab = "atlas";
+  document.querySelectorAll(".tabs button").forEach((b) =>
+    b.classList.toggle("active", b.dataset.tab === state.tab)
+  );
   state.project = id;
   state.selected = null;
   state.snippet = null;
@@ -192,6 +221,10 @@ async function loadCoverage() {
 
 function renderWorkspace() {
   const root = $("workspace");
+  if (state.tab === "usage") {
+    renderUsage(root);
+    return;
+  }
   if (!state.project) {
     root.innerHTML = `<div class="empty">Add a project to open its atlas.</div>`;
     return;
@@ -201,6 +234,12 @@ function renderWorkspace() {
   else if (state.tab === "explore") renderExplore(root);
   else if (state.tab === "tools") renderTools(root);
   else renderCoverage(root);
+}
+
+async function loadUsage() {
+  const windowName = state.usageWindow === "all" ? "all" : "day";
+  const res = await fetch(`/api/usage?window=${windowName}`);
+  state.usage = await res.json();
 }
 
 function renderAtlas(root) {
@@ -226,8 +265,8 @@ function renderAtlas(root) {
             .join("")}
         </div>
         ${graph.note ? `<div class="note">${esc(graph.note)}</div>` : ""}
+        <div class="atlas-tip" id="atlas-tip" hidden></div>
       </div>
-      <aside class="inspector" id="inspector">${inspectorHtml()}</aside>
     </div>`;
   root.querySelectorAll("[data-view]").forEach((btn) => {
     btn.onclick = async () => {
@@ -238,15 +277,35 @@ function renderAtlas(root) {
   });
   const canvas = $("graph");
   if (canvas) startGraph(canvas, graph);
+  if (state.selected) showAtlasTip(state.selected);
+}
+
+function atlasTipHtml(node) {
+  const file = node.file_path
+    ? `${node.file_path}${node.start_line ? `:${node.start_line}` : ""}`
+    : "—";
+  return `<strong>${esc(node.name || node.qualified_name)}</strong>
+    <small>${esc(node.label || "Node")} · in ${node.in_degree ?? "—"} · out ${node.out_degree ?? "—"}</small>
+    <code>${esc(node.qualified_name || node.name || "")}</code>
+    <small>${esc(file)}</small>`;
+}
+
+function showAtlasTip(node) {
+  const tip = $("atlas-tip");
+  if (!tip) return;
+  if (!node) {
+    tip.hidden = true;
+    tip.innerHTML = "";
+    return;
+  }
+  tip.hidden = false;
+  tip.innerHTML = atlasTipHtml(node);
 }
 
 function inspectorHtml() {
   const node = state.selected;
   if (!node) {
-    return `<h2>Inspector</h2><p class="empty">Click a node to inspect it. Double-click to walk its neighbourhood.</p>
-      <p class="empty">${state.graph?.node_count || 0} nodes · ${state.graph?.edge_count || 0} edges${
-      state.graph?.truncated ? " · truncated" : ""
-    }</p>`;
+    return `<p class="empty">Pick a hit.</p>`;
   }
   return `
     <h2>${esc(node.name)}</h2>
@@ -314,8 +373,54 @@ function renderOverview(root) {
     </div>`;
 }
 
-function stat(label, value) {
-  return `<div class="stat"><em>${label}</em><strong>${value ?? "—"}</strong></div>`;
+function successRate(ok, calls) {
+  if (!calls) return 0;
+  return Math.round((ok / calls) * 100);
+}
+
+function windowToggle(active) {
+  return `<div class="usage-window">
+    <button type="button" class="chip${active === "day" ? " active" : ""}" data-window="day">Last 24 hours</button>
+    <button type="button" class="chip${active === "all" ? " active" : ""}" data-window="all">All</button>
+  </div>`;
+}
+
+function bindWindowToggle(root) {
+  root.querySelectorAll("[data-window]").forEach((btn) => {
+    btn.onclick = async () => {
+      if (state.usageWindow === btn.dataset.window) return;
+      state.usageWindow = btn.dataset.window;
+      root.innerHTML = `<div class="empty">Loading…</div>`;
+      await loadUsage();
+      renderWorkspace();
+    };
+  });
+}
+
+function sessionRows(sessions) {
+  if (!sessions.length) return "";
+  const rows = sessions
+    .map((s) => {
+      const projects = (s.projects || []).join(", ") || "—";
+      const first = s.list_projects_first ? s.first_tool : `${s.first_tool} (not list_projects)`;
+      return `<tr><td>${fmtTime(s.first_at_unix)} → ${fmtTime(s.last_at_unix)}</td><td>${s.calls}</td><td>${esc(first)}</td><td>${esc(projects)}</td></tr>`;
+    })
+    .join("");
+  return `<h3 class="usage-heading">Sessions</h3>
+    <div class="card">
+      <table class="table">
+        <tr><th>when</th><th>calls</th><th>started with</th><th>projects</th></tr>
+        ${rows}
+      </table>
+    </div>`;
+}
+
+function usageBucket(u, projectId) {
+  return (u.by_project || []).find((p) => p.project === projectId) || null;
+}
+
+function stat(label, value, tone) {
+  return `<div class="stat${tone ? ` tone-${tone}` : ""}"><em>${label}</em><strong>${value ?? "—"}</strong></div>`;
 }
 function bar(label, value, max) {
   return `<div class="bar"><span>${esc(label)}</span><i><b style="width:${Math.round((value / max) * 100)}%"></b></i><span>${value}</span></div>`;
@@ -406,14 +511,6 @@ async function openSymbol(qn) {
   state.selected = (search.results || [])[0] || { qualified_name: qn, name: qn.split(".").pop() };
   state.snippet = snippet;
   if (state.tab === "explore") renderWorkspace();
-  else {
-    const inspector = $("inspector");
-    if (inspector) {
-      inspector.innerHTML = inspectorHtml();
-      const btn = $("open-trace");
-      if (btn) btn.onclick = () => runTrace(qn);
-    }
-  }
 }
 
 async function runTrace(qn) {
@@ -513,6 +610,189 @@ function openTool(name) {
       toast(error.message, "err");
     }
   };
+}
+
+function renderUsage(root) {
+  const u = state.usage;
+  if (!u) {
+    root.innerHTML = `<div class="empty">Loading agent usage…</div>`;
+    return;
+  }
+  if (!u.total_calls) {
+    const emptyDay = u.window === "day";
+    root.innerHTML = `<div class="usage">${windowToggle(state.usageWindow)}
+      <div class="empty">${
+        emptyDay
+          ? "No MCP tool calls in the last 24 hours. Switch to All to see the rest of the journal."
+          : `No MCP tool calls recorded yet. The journal is ${esc(u.journal_path || "agent_calls.jsonl")}.`
+      }</div>
+    </div>`;
+    bindWindowToggle(root);
+    return;
+  }
+  if (state.surface === "project" && state.project) {
+    renderProjectUsage(root, u, state.project);
+    return;
+  }
+  const criteria = u.criteria || {};
+  const toolStats = Object.entries(u.by_tool_stats || {});
+  const maxTool = Math.max(1, ...toolStats.map(([, s]) => s.calls));
+  const selected = state.project;
+  const window =
+    u.first_at_unix && u.last_at_unix
+      ? `${fmtTime(u.first_at_unix)} → ${fmtTime(u.last_at_unix)}`
+      : "";
+  const success = successRate(u.ok, u.total_calls);
+  const pageRate =
+    criteria.pagination_needed > 0
+      ? `${criteria.pagination_followed}/${criteria.pagination_needed}`
+      : "—";
+  const walkRate =
+    criteria.walk_calls > 0
+      ? `${criteria.walk_calls - criteria.walk_failures}/${criteria.walk_calls}`
+      : "—";
+
+  root.innerHTML = `
+    <div class="usage">
+      ${windowToggle(u.window || state.usageWindow)}
+      <div class="card">
+        <h3>Global · ${u.window === "day" ? "last 24 hours" : "all journal"} · ${esc(window)}</h3>
+        <p class="empty" style="padding:0 0 10px">Source: ${esc(u.journal_path)}. The questions are from docs/cursor-agent.md.</p>
+        <div class="cards">
+          ${stat("Calls", u.total_calls)}
+          ${stat("Succeeded", `${success}%`, success >= 80 ? "ok" : "warn")}
+          ${stat("Graph / grep", `${u.graph_calls} / ${u.text_search_calls}`, u.graph_calls >= u.text_search_calls ? "ok" : "warn")}
+          ${stat("Walk tools ok", walkRate, criteria.walk_failures ? "bad" : "ok")}
+        </div>
+        <table class="table" style="margin-top:12px">
+          <tr><th>Design question</th><th>Observed</th></tr>
+          <tr><td>list_projects first?</td><td>${criteria.list_projects_first || 0} / ${criteria.sessions || 0} sessions</td></tr>
+          <tr><td>Does it page?</td><td>${pageRate} has_more followed by cursor</td></tr>
+          <tr><td>search_graph over search_code?</td><td>${u.graph_calls} structural · ${u.text_search_calls} search_code</td></tr>
+          <tr><td>Walk tools (trace_path, query_graph)</td><td>${criteria.walk_failures || 0} failed of ${criteria.walk_calls || 0}</td></tr>
+          <tr><td>Freshness after edits?</td><td>detect_changes ${criteria.detect_changes || 0} · check_index_coverage ${criteria.check_index_coverage || 0}</td></tr>
+          <tr><td>Wrong project id?</td><td class="${criteria.project_not_found ? "tone-bad" : ""}">${criteria.project_not_found || 0} project_not_found</td></tr>
+        </table>
+      </div>
+      ${sessionRows(u.sessions || [])}
+      <div class="bars">
+        <div class="card">
+          <h3>Tools</h3>
+          ${toolStats
+            .sort((a, b) => b[1].calls - a[1].calls)
+            .map(
+              ([name, s]) =>
+                `${bar(name, s.calls, maxTool)}<small class="usage-meta">${s.fail} fail · p50 ${s.duration_p50_ms} ms · p95 ${s.duration_p95_ms} ms</small>`
+            )
+            .join("") || empty()}
+        </div>
+        <div class="card">
+          <h3>Errors</h3>
+          ${
+            Object.keys(u.by_error_code || {}).length
+              ? `<table class="table"><tr><th>code</th><th>count</th></tr>${Object.entries(
+                  u.by_error_code
+                )
+                  .map(([code, n]) => `<tr><td>${esc(code)}</td><td>${n}</td></tr>`)
+                  .join("")}</table>`
+              : `<p class="empty">No recorded errors.</p>`
+          }
+          ${(u.common_sequences || []).length
+            ? `<h3 style="margin-top:16px">Common sequences</h3><table class="table">${u.common_sequences
+                .map(([seq, n]) => `<tr><td>${esc(seq)}</td><td>${n}</td></tr>`)
+                .join("")}</table>`
+            : ""}
+        </div>
+      </div>
+      <h3 class="usage-heading">Per project</h3>
+      <div class="usage-projects">
+        ${(u.by_project || [])
+          .map((p) => {
+            const id = p.project || "(no project)";
+            const active = p.project && p.project === selected;
+            const tools = Object.entries(p.by_tool || {})
+              .sort((a, b) => b[1] - a[1])
+              .map(([name, n]) => `<tr><td>${esc(name)}</td><td>${n}</td></tr>`)
+              .join("");
+            const errors = Object.entries(p.by_error_code || {})
+              .map(([code, n]) => `${esc(code)} ${n}`)
+              .join(" · ");
+            const rate = successRate(p.ok, p.calls);
+            return `<div class="card${active ? " active" : ""}">
+              <h3>${esc(id)}${active ? " · selected" : ""}</h3>
+              <div class="cards cards-3">
+                ${stat("Calls", p.calls)}
+                ${stat("Succeeded", `${rate}%`, rate >= 80 ? "ok" : "warn")}
+                ${stat("Failed", p.fail, p.fail ? "bad" : "ok")}
+              </div>
+              <p class="usage-meta">${fmtTime(p.first_at_unix)} → ${fmtTime(p.last_at_unix)} · paged ${p.paged_followthrough}/${p.truncated_responses}${
+                errors ? ` · ${errors}` : ""
+              }</p>
+              <table class="table"><tr><th>tool</th><th>calls</th></tr>${tools}</table>
+            </div>`;
+          })
+          .join("")}
+      </div>
+    </div>`;
+  bindWindowToggle(root);
+}
+
+function renderProjectUsage(root, u, projectId) {
+  const p = usageBucket(u, projectId);
+  if (!p) {
+    root.innerHTML = `<div class="usage">${windowToggle(state.usageWindow)}
+      <div class="empty">No MCP tool calls recorded for ${esc(
+        projectId
+      )} in this window. Calls without a project argument are only on Day performance.</div>
+    </div>`;
+    bindWindowToggle(root);
+    return;
+  }
+  const rate = successRate(p.ok, p.calls);
+  const tools = Object.entries(p.by_tool || {})
+    .sort((a, b) => b[1] - a[1])
+    .map(([name, n]) => `<tr><td>${esc(name)}</td><td>${n}</td></tr>`)
+    .join("");
+  const errors = Object.entries(p.by_error_code || {})
+    .map(([code, n]) => `<tr><td>${esc(code)}</td><td>${n}</td></tr>`)
+    .join("");
+  const sessions = (u.sessions || []).filter((s) => (s.projects || []).includes(projectId));
+  root.innerHTML = `
+    <div class="usage">
+      ${windowToggle(u.window || state.usageWindow)}
+      <div class="card">
+        <h3>${esc(p.project)} · ${u.window === "day" ? "last 24 hours" : "all journal"} · ${fmtTime(p.first_at_unix)} → ${fmtTime(p.last_at_unix)}</h3>
+        <div class="cards">
+          ${stat("Calls", p.calls)}
+          ${stat("Succeeded", `${rate}%`, rate >= 80 ? "ok" : "warn")}
+          ${stat("Failed", p.fail, p.fail ? "bad" : "ok")}
+          ${stat("Graph / grep", `${p.graph_calls} / ${p.text_search_calls}`)}
+        </div>
+        <p class="usage-meta">paged ${p.paged_followthrough}/${p.truncated_responses} · from ${esc(
+          u.journal_path
+        )}</p>
+      </div>
+      ${sessionRows(sessions)}
+      <div class="bars">
+        <div class="card">
+          <h3>Tools</h3>
+          ${
+            tools
+              ? `<table class="table"><tr><th>tool</th><th>calls</th></tr>${tools}</table>`
+              : empty()
+          }
+        </div>
+        <div class="card">
+          <h3>Errors</h3>
+          ${
+            errors
+              ? `<table class="table"><tr><th>code</th><th>count</th></tr>${errors}</table>`
+              : `<p class="empty">No recorded errors.</p>`
+          }
+        </div>
+      </div>
+    </div>`;
+  bindWindowToggle(root);
 }
 
 function renderCoverage(root) {
@@ -674,25 +954,14 @@ function startGraph(canvas, payload) {
       panY = ev.offsetY - panning.y;
     }
   };
-  canvas.onmouseup = async (ev) => {
+  canvas.onmouseup = (ev) => {
     const n = nodeAt(ev.offsetX, ev.offsetY);
     if (n && drag) {
       state.selected = n;
-      try {
-        state.snippet = await apiTool("get_code_snippet", {
-          project: state.project,
-          qualified_name: n.qualified_name,
-          context_lines: 2,
-        });
-      } catch {
-        state.snippet = null;
-      }
-      const inspector = $("inspector");
-      if (inspector) {
-        inspector.innerHTML = inspectorHtml();
-        const btn = $("open-trace");
-        if (btn) btn.onclick = () => runTrace(n.qualified_name);
-      }
+      showAtlasTip(n);
+    } else if (!n && !drag) {
+      state.selected = null;
+      showAtlasTip(null);
     }
     drag = null;
     panning = null;
@@ -804,6 +1073,7 @@ function startGraph(canvas, payload) {
   tick();
 }
 
+$("nav-performance").onclick = () => openPerformance();
 $("add-project").onclick = openAddProject;
 $("reindex").onclick = async () => {
   const entry = state.projects.find((p) => p.project === state.project);
@@ -845,6 +1115,7 @@ $("tabs").onclick = async (ev) => {
   document.querySelectorAll(".tabs button").forEach((b) => b.classList.toggle("active", b === btn));
   if (state.tab === "atlas" && !state.graph) await loadGraph();
   if (state.tab === "coverage" && !state.coverage) await loadCoverage();
+  if (state.tab === "usage") await loadUsage();
   renderWorkspace();
 };
 $("global-search").onkeydown = async (ev) => {
@@ -869,4 +1140,5 @@ $("modal").onclick = (ev) => {
     state.tools = [];
   }
   await loadProjects();
+  await openPerformance();
 })();

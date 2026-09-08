@@ -797,3 +797,95 @@ fn the_graph_survives_a_process_restart() {
         "symbols must still be queryable after the writing process exited"
     );
 }
+
+/// Argument shapes recorded in agent_calls.jsonl during the first day of
+/// Cursor use. Those calls returned invalid_argument; they must now succeed
+/// on the sample fixture.
+#[test]
+fn journalled_argument_shapes_that_failed_in_day_one_now_work() {
+    let _guard = serial();
+    let (project, fixture) = indexed_fixture("aliases");
+    let basename = fixture
+        .path()
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("temp dir name");
+
+    let from_trace = call(
+        "trace_path",
+        json!({
+            "project": project,
+            "from": "services.orders-py.app.repository.save_order",
+            "direction": "in",
+            "depth": 4
+        }),
+    );
+    assert!(
+        from_trace["error"].is_null(),
+        "from + direction=in must be accepted: {from_trace}"
+    );
+    assert!(from_trace["callers_total"].as_u64().unwrap() >= 1);
+
+    let hops = call(
+        "query_graph",
+        json!({
+            "project": project,
+            "start": { "label": "Route" },
+            "hops": [{ "edge_type": "ROUTES_TO", "direction": "outbound" }]
+        }),
+    );
+    assert!(
+        hops["error"].is_null(),
+        "edge_type hop alias must work: {hops}"
+    );
+    assert!(!hops["rows"].as_array().unwrap().is_empty());
+
+    let query_search = call(
+        "search_graph",
+        json!({ "project": project, "query": "create_order" }),
+    );
+    assert!(
+        query_search["total"].as_u64().unwrap() >= 1,
+        "query must not dump the whole graph: {query_search}"
+    );
+
+    let coverage = call(
+        "check_index_coverage",
+        json!({ "project": project, "status": "skipped" }),
+    );
+    assert!(
+        coverage["error"].is_null(),
+        "coverage without paths/scopes must default to the project: {coverage}"
+    );
+    assert!(coverage["total"].as_u64().unwrap() >= 1);
+
+    let snippet = call(
+        "get_code_snippet",
+        json!({ "project": project, "name": "save_order" }),
+    );
+    assert!(
+        snippet["source"]
+            .as_str()
+            .unwrap()
+            .contains("def save_order"),
+        "name alias must read the unique symbol: {snippet}"
+    );
+
+    let text = call(
+        "search_code",
+        json!({ "project": project, "query": "create_order", "path": "services/orders.py" }),
+    );
+    assert!(text["error"].is_null(), "query/path aliases: {text}");
+
+    let via_basename = call("index_status", json!({ "project": basename }));
+    assert!(
+        via_basename["error"].is_null(),
+        "unique root basename must resolve: {via_basename}"
+    );
+    assert_eq!(via_basename["project"], project);
+
+    let architecture = call("get_architecture", json!({ "project": project }));
+    assert!(architecture["routes"].as_array().unwrap().len() <= 50);
+    assert!(architecture["entry_points"].as_array().unwrap().len() <= 50);
+    assert!(architecture["route_total"].as_u64().unwrap() >= 8);
+}

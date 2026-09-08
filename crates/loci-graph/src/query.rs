@@ -191,8 +191,8 @@ pub enum Direction {
 impl Direction {
     pub fn parse(s: &str) -> Result<Self> {
         Ok(match s {
-            "inbound" => Self::Inbound,
-            "outbound" => Self::Outbound,
+            "inbound" | "in" | "callers" => Self::Inbound,
+            "outbound" | "out" | "callees" => Self::Outbound,
             "both" => Self::Both,
             other => {
                 return Err(LociError::InvalidArgument(format!(
@@ -354,6 +354,10 @@ pub fn trace(
 #[derive(Debug, Clone, Deserialize)]
 pub struct Hop {
     /// Edge type name, e.g. "CALLS".
+    ///
+    /// `edge_type` is accepted because that is the name `get_graph_schema`
+    /// uses, and agents copy it.
+    #[serde(alias = "edge_type")]
     pub edge: String,
     /// "out" (default) or "in".
     #[serde(default)]
@@ -439,8 +443,8 @@ pub fn run_pattern(reader: &GraphReader, query: &PatternQuery) -> Result<Pattern
             LociError::InvalidArgument(format!("unknown edge type '{}'", hop.edge))
         })?;
         let outbound = match hop.direction.as_deref() {
-            None | Some("out") => true,
-            Some("in") => false,
+            None | Some("out") | Some("outbound") | Some("callees") => true,
+            Some("in") | Some("inbound") | Some("callers") => false,
             Some(other) => {
                 return Err(LociError::InvalidArgument(format!(
                     "hop direction must be 'in' or 'out'; got '{other}'"

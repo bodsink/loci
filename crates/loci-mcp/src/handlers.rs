@@ -1,6 +1,6 @@
 use loci_core::{LociError, Result, Sandbox};
 use loci_graph::{
-    catalog::Catalog,
+    catalog::{Catalog, ProjectEntry},
     coverage::{self, COVERAGE_NOTE},
     query::{self, Direction, PatternQuery, SearchRequest},
     Edge, EdgeType, Evidence, GraphStore, NodeLabel,
@@ -33,22 +33,106 @@ fn required_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
         .ok_or_else(|| LociError::InvalidArgument(format!("'{key}' is required")))
 }
 
+fn first_str<'a>(args: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter().find_map(|key| {
+        args.get(*key)
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+    })
+}
+
+fn looks_like_regex(value: &str) -> bool {
+    value.chars().any(|c| {
+        matches!(
+            c,
+            '^' | '$' | '*' | '+' | '?' | '[' | ']' | '(' | ')' | '{' | '}' | '|' | '\\'
+        )
+    })
+}
+
+/// Map the names agents actually send onto the SearchRequest fields.
+fn apply_query_alias(
+    args: &Value,
+    name: Option<String>,
+    name_pattern: Option<String>,
+) -> (Option<String>, Option<String>) {
+    if name.is_some() || name_pattern.is_some() {
+        return (name, name_pattern);
+    }
+    match first_str(args, &["query"]) {
+        Some(query) if looks_like_regex(query) => (None, Some(query.to_string())),
+        Some(query) => (Some(query.to_string()), None),
+        None => (name, name_pattern),
+    }
+}
+
+fn normalize_start_selector(mut start: Value) -> Value {
+    let Some(object) = start.as_object_mut() else {
+        return start;
+    };
+    if !object.contains_key("name")
+        && !object.contains_key("name_pattern")
+        && !object.contains_key("qualified_name")
+    {
+        if let Some(query) = object.remove("query") {
+            if query.as_str().is_some_and(looks_like_regex) {
+                object.insert("name_pattern".into(), query);
+            } else {
+                object.insert("name".into(), query);
+            }
+        }
+    }
+    start
+}
+
+fn normalize_hops(hops: Value) -> Value {
+    let Some(items) = hops.as_array() else {
+        return hops;
+    };
+    let mapped: Vec<Value> = items
+        .iter()
+        .map(|hop| {
+            if let Some(edge) = hop.as_str() {
+                return json!({ "edge": edge });
+            }
+            let mut hop = hop.clone();
+            if let Some(object) = hop.as_object_mut() {
+                if !object.contains_key("edge") {
+                    if let Some(edge_type) = object.remove("edge_type") {
+                        object.insert("edge".into(), edge_type);
+                    }
+                }
+                if let Some(Value::String(direction)) = object.get("direction") {
+                    let mapped = match direction.as_str() {
+                        "inbound" | "callers" => "in",
+                        "outbound" | "callees" => "out",
+                        other => other,
+                    };
+                    object.insert("direction".into(), json!(mapped));
+                }
+            }
+            hop
+        })
+        .collect();
+    json!(mapped)
+}
+
 /// Open a project's graph and a sandbox over its root.
 ///
 /// The sandbox is built from the recorded root, which may have been deleted
 /// since indexing; that surfaces as an explicit error rather than a panic.
-fn open(project: &str) -> Result<(GraphStore, Sandbox, String)> {
+fn open(project: &str) -> Result<(GraphStore, Sandbox, ProjectEntry)> {
     open_with(project, loci_index::open_project)
 }
 
-fn open_write(project: &str) -> Result<(GraphStore, Sandbox, String)> {
+fn open_write(project: &str) -> Result<(GraphStore, Sandbox, ProjectEntry)> {
     open_with(project, loci_index::open_project_write)
 }
 
 fn open_with(
     project: &str,
-    open_store: fn(&str) -> Result<(loci_graph::ProjectEntry, GraphStore)>,
-) -> Result<(GraphStore, Sandbox, String)> {
+    open_store: fn(&str) -> Result<(ProjectEntry, GraphStore)>,
+) -> Result<(GraphStore, Sandbox, ProjectEntry)> {
     let (entry, store) = open_store(project)?;
     let root = Path::new(&entry.root);
     let sandbox = Sandbox::new(root).map_err(|_| {
@@ -57,7 +141,7 @@ fn open_with(
             entry.root
         ))
     })?;
-    Ok((store, sandbox, entry.root))
+    Ok((store, sandbox, entry))
 }
 
 pub fn list_projects(args: &Value) -> Result<Value> {
@@ -124,8 +208,10 @@ pub fn delete_project(args: &Value) -> Result<Value> {
 }
 
 pub fn index_status(args: &Value) -> Result<Value> {
-    let project = required_str(args, "project")?;
-    let (store, _, root) = open(project)?;
+    let requested = required_str(args, "project")?;
+    let (store, _, entry) = open(requested)?;
+    let project = entry.id.as_str();
+    let root = entry.root.as_str();
     let reader = store.read()?;
 
     let meta = reader
@@ -182,13 +268,15 @@ pub fn check_index_coverage(args: &Value) -> Result<Value> {
     let paths = args.get("paths").and_then(Value::as_array);
     let scopes = args.get("scopes").and_then(Value::as_array);
 
-    if paths.is_none_or(|p| p.is_empty()) && scopes.is_none_or(|s| s.is_empty()) {
-        return Err(LociError::InvalidArgument(
-            "provide at least one of 'paths' or 'scopes'".to_string(),
-        ));
-    }
+    let default_scope = json!(["."]);
+    let scopes = match scopes {
+        Some(s) if !s.is_empty() => Some(s),
+        _ if paths.is_none_or(|p| p.is_empty()) => Some(default_scope.as_array().expect("array")),
+        _ => scopes,
+    };
 
-    let (store, sandbox, _) = open(project)?;
+    let (store, sandbox, entry) = open(project)?;
+    let project = entry.id.as_str();
     let reader = store.read()?;
     let matcher = IgnoreMatcher::build(sandbox.root());
 
@@ -237,8 +325,9 @@ pub fn check_index_coverage(args: &Value) -> Result<Value> {
 }
 
 pub fn detect_changes(args: &Value) -> Result<Value> {
-    let project = required_str(args, "project")?;
-    let (store, sandbox, _) = open(project)?;
+    let requested = required_str(args, "project")?;
+    let (store, sandbox, entry) = open(requested)?;
+    let project = entry.id.as_str();
     let report = changes::detect_changes(
         &store,
         &sandbox,
@@ -250,16 +339,20 @@ pub fn detect_changes(args: &Value) -> Result<Value> {
 }
 
 fn search_request_from(args: &Value, limit: usize, offset: usize) -> SearchRequest {
+    let (name, name_pattern) = apply_query_alias(
+        args,
+        args.get("name").and_then(Value::as_str).map(str::to_string),
+        args.get("name_pattern")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    );
     SearchRequest {
-        name: args.get("name").and_then(Value::as_str).map(str::to_string),
+        name,
         qualified_name: args
             .get("qualified_name")
             .and_then(Value::as_str)
             .map(str::to_string),
-        name_pattern: args
-            .get("name_pattern")
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        name_pattern,
         label: args
             .get("label")
             .and_then(Value::as_str)
@@ -274,8 +367,9 @@ fn search_request_from(args: &Value, limit: usize, offset: usize) -> SearchReque
 }
 
 pub fn search_graph(args: &Value) -> Result<Value> {
-    let project = required_str(args, "project")?;
-    let (store, _, _) = open(project)?;
+    let requested = required_str(args, "project")?;
+    let (store, _, entry) = open(requested)?;
+    let project = entry.id.as_str();
     let reader = store.read()?;
 
     let limit = limit_from(args, 50);
@@ -295,18 +389,32 @@ pub fn search_graph(args: &Value) -> Result<Value> {
 }
 
 pub fn query_graph(args: &Value) -> Result<Value> {
-    let project = required_str(args, "project")?;
-    let (store, _, _) = open(project)?;
+    let requested = required_str(args, "project")?;
+    let (store, _, entry) = open(requested)?;
+    let project = entry.id.as_str();
     let reader = store.read()?;
 
-    let start = args
-        .get("start")
-        .cloned()
-        .ok_or_else(|| LociError::InvalidArgument("'start' is required".to_string()))?;
+    let start = match args.get("start") {
+        None | Some(Value::Null) => {
+            return Err(LociError::InvalidArgument(
+                if args.get("edge_type").is_some() {
+                    "'start' is required. To walk an edge type, pass start (for example \
+                     {\"label\":\"Route\"}) and hops=[{\"edge\":\"ROUTES_TO\"}]. A top-level \
+                     'edge_type' is not a query."
+                        .to_string()
+                } else {
+                    "'start' is required".to_string()
+                },
+            ));
+        }
+        Some(Value::String(qualified_name)) => json!({ "qualified_name": qualified_name }),
+        Some(other) => other.clone(),
+    };
+    let start = normalize_start_selector(start);
     let start: SearchRequest = serde_json::from_value(start)
         .map_err(|e| LociError::InvalidArgument(format!("bad 'start' selector: {e}")))?;
 
-    let hops = args.get("hops").cloned().unwrap_or_else(|| json!([]));
+    let hops = normalize_hops(args.get("hops").cloned().unwrap_or_else(|| json!([])));
     let pattern = PatternQuery {
         start,
         hops: serde_json::from_value(hops)
@@ -331,17 +439,14 @@ pub fn query_graph(args: &Value) -> Result<Value> {
 }
 
 pub fn trace_path(args: &Value) -> Result<Value> {
-    let project = required_str(args, "project")?;
-    let (store, _, _) = open(project)?;
+    let requested = required_str(args, "project")?;
+    let (store, _, entry) = open(requested)?;
+    let project = entry.id.as_str();
     let reader = store.read()?;
 
-    let reference = args
-        .get("qualified_name")
-        .and_then(Value::as_str)
-        .or_else(|| args.get("name").and_then(Value::as_str))
-        .ok_or_else(|| {
-            LociError::InvalidArgument("pass 'qualified_name' (preferred) or 'name'".to_string())
-        })?;
+    let reference = first_str(args, &["qualified_name", "name", "from"]).ok_or_else(|| {
+        LociError::InvalidArgument("pass 'qualified_name' (preferred) or 'name'".to_string())
+    })?;
 
     let node = match query::resolve_symbol(&reader, reference) {
         Ok(node) => node,
@@ -396,14 +501,16 @@ pub fn trace_path(args: &Value) -> Result<Value> {
 
 pub fn get_code_snippet(args: &Value) -> Result<Value> {
     let project = required_str(args, "project")?;
-    let reference = required_str(args, "qualified_name")?;
+    let reference = first_str(args, &["qualified_name", "name"])
+        .ok_or_else(|| LociError::InvalidArgument("'qualified_name' is required".to_string()))?;
     let context = args
         .get("context_lines")
         .and_then(Value::as_u64)
         .unwrap_or(0)
         .min(50) as u32;
 
-    let (store, sandbox, _) = open(project)?;
+    let (store, sandbox, entry) = open(project)?;
+    let project = entry.id.as_str();
     let reader = store.read()?;
 
     let node = match query::resolve_symbol(&reader, reference) {
@@ -549,9 +656,11 @@ fn edge_description(edge: EdgeType) -> &'static str {
 }
 
 pub fn get_architecture(args: &Value) -> Result<Value> {
-    let project = required_str(args, "project")?;
+    let requested = required_str(args, "project")?;
     let scope = args.get("path").and_then(Value::as_str).unwrap_or("");
-    let (store, _, root) = open(project)?;
+    let (store, _, entry) = open(requested)?;
+    let project = entry.id.as_str();
+    let root = entry.root.as_str();
     let reader = store.read()?;
 
     let in_scope =
@@ -596,6 +705,9 @@ pub fn get_architecture(args: &Value) -> Result<Value> {
         }));
     }
     routes.sort_by(|a, b| a["path"].to_string().cmp(&b["path"].to_string()));
+    let route_total = routes.len();
+    let routes_truncated = routes.len() > 50;
+    routes.truncate(50);
 
     // Entry points: callables nothing in the graph calls.
     let mut entry_points = Vec::new();
@@ -633,8 +745,11 @@ pub fn get_architecture(args: &Value) -> Result<Value> {
         "languages": languages,
         "labels": labels,
         "routes": routes,
+        "route_total": route_total,
+        "routes_has_more": routes_truncated,
         "entry_points": entry_points,
         "entry_point_total": entry_point_total,
+        "entry_points_has_more": entry_point_total > 50,
         "largest_files_by_symbol_count": largest,
         "note": "Counted from the graph. Entry points are callables with no inbound CALLS edge in \
                  this index, which includes symbols called only from unindexed or unresolved code.",
@@ -643,17 +758,19 @@ pub fn get_architecture(args: &Value) -> Result<Value> {
 
 pub fn search_code(args: &Value) -> Result<Value> {
     let project = required_str(args, "project")?;
-    let pattern = required_str(args, "pattern")?;
+    let pattern = first_str(args, &["pattern", "query"])
+        .ok_or_else(|| LociError::InvalidArgument("'pattern' is required".to_string()))?;
     let use_regex = args.get("regex").and_then(Value::as_bool).unwrap_or(false);
     let case_sensitive = args
         .get("case_sensitive")
         .and_then(Value::as_bool)
         .unwrap_or(true);
 
-    let (store, sandbox, _) = open(project)?;
+    let (store, sandbox, entry) = open(project)?;
+    let project = entry.id.as_str();
     let reader = store.read()?;
 
-    let file_filter = match args.get("file_pattern").and_then(Value::as_str) {
+    let file_filter = match first_str(args, &["file_pattern", "path"]) {
         Some(p) => Some(
             regex::Regex::new(p)
                 .map_err(|e| LociError::InvalidArgument(format!("bad file_pattern: {e}")))?,
@@ -761,10 +878,11 @@ pub fn search_code(args: &Value) -> Result<Value> {
 pub fn manage_adr(args: &Value) -> Result<Value> {
     let project = required_str(args, "project")?;
     let mode = args.get("mode").and_then(Value::as_str).unwrap_or("list");
-    let (store, _, _) = match mode {
+    let (store, _, entry) = match mode {
         "upsert" | "delete" => open_write(project)?,
         _ => open(project)?,
     };
+    let project = entry.id.as_str();
 
     match mode {
         "list" => {
@@ -857,7 +975,8 @@ pub fn ingest_traces(args: &Value) -> Result<Value> {
         .and_then(Value::as_array)
         .ok_or_else(|| LociError::InvalidArgument("'traces' must be an array".to_string()))?;
 
-    let (store, _, _) = open_write(project)?;
+    let (store, _, entry) = open_write(project)?;
+    let project = entry.id.as_str();
 
     let mut linked = Vec::new();
     let mut unmatched = Vec::new();

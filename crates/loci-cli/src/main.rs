@@ -31,7 +31,7 @@ struct Cli {
     command: Command,
 }
 
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 enum Command {
     /// Register loci with Cursor by adding a server entry to ~/.cursor/mcp.json.
     Install {
@@ -99,17 +99,31 @@ enum Command {
     Mcp,
 
     /// Serve the local web UI for inspecting indexed projects.
+    ///
+    /// `loci ui` and `loci ui start` bind the page. `loci ui stop` ends the
+    /// process holding `--bind`/`--port` (default 127.0.0.1:7420).
     Ui {
         /// Address to bind. Loopback only is the safe default.
-        #[arg(long, default_value = "127.0.0.1")]
+        #[arg(long, default_value = "127.0.0.1", global = true)]
         bind: String,
-        /// Port to listen on.
-        #[arg(long, default_value_t = 7420)]
+        /// Preferred port. If a loci UI is already there, that instance is
+        /// reused. If something else holds the port, the next free one is used.
+        #[arg(long, default_value_t = 7420, global = true)]
         port: u16,
         /// Do not open a browser.
-        #[arg(long)]
+        #[arg(long, global = true)]
         no_open: bool,
+        #[command(subcommand)]
+        action: Option<UiAction>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum UiAction {
+    /// Bind the web UI (same as `loci ui` with no subcommand).
+    Start,
+    /// Stop the web UI that is listening on --bind/--port.
+    Stop,
 }
 
 fn main() -> ExitCode {
@@ -156,11 +170,51 @@ fn run(cli: &Cli) -> Result<()> {
             bind,
             port,
             no_open,
-        } => ui::run(&ui::ServeOptions {
-            bind: bind.clone(),
-            port: *port,
-            open_browser: !no_open,
-        }),
+            action,
+        } => match action {
+            None | Some(UiAction::Start) => ui::run(&ui::ServeOptions {
+                bind: bind.clone(),
+                port: *port,
+                open_browser: !no_open,
+            }),
+            Some(UiAction::Stop) => cmd_ui_stop(bind, *port, cli.json),
+        },
+    }
+}
+
+fn cmd_ui_stop(bind: &str, port: u16, as_json: bool) -> Result<()> {
+    match ui::stop(bind, port)? {
+        ui::StopOutcome::Stopped { pid, url } => {
+            if as_json {
+                println!(
+                    "{}",
+                    json!({
+                        "stopped": true,
+                        "pid": pid,
+                        "url": url,
+                    })
+                );
+            } else {
+                println!("Stopped loci ui on {url} (pid {pid}).");
+            }
+            Ok(())
+        }
+        ui::StopOutcome::NotRunning { bind, port } => {
+            if as_json {
+                println!(
+                    "{}",
+                    json!({
+                        "stopped": false,
+                        "running": false,
+                        "bind": bind,
+                        "port": port,
+                    })
+                );
+            } else {
+                println!("loci ui is not running on {bind}:{port}.");
+            }
+            Ok(())
+        }
     }
 }
 
@@ -347,6 +401,14 @@ fn cmd_status(project: Option<&str>, agent_usage: bool, as_json: bool) -> Result
             return Ok(());
         }
         println!(
+            "  ok: {}, fail: {}, sessions: {}, list_projects first: {}/{}",
+            summary.ok,
+            summary.fail,
+            summary.criteria.sessions,
+            summary.criteria.list_projects_first,
+            summary.criteria.sessions
+        );
+        println!(
             "  graph tools: {}, search_code: {}",
             summary.graph_calls, summary.text_search_calls
         );
@@ -354,6 +416,30 @@ fn cmd_status(project: Option<&str>, agent_usage: bool, as_json: bool) -> Result
             "  truncated responses: {}, follow-up pages requested: {}",
             summary.truncated_responses, summary.pages_requested
         );
+        println!(
+            "  freshness: detect_changes {}, check_index_coverage {}",
+            summary.criteria.detect_changes, summary.criteria.check_index_coverage
+        );
+        if summary.criteria.project_not_found > 0 {
+            println!(
+                "  project_not_found: {} (agent guessed an id)",
+                summary.criteria.project_not_found
+            );
+        }
+        if !summary.sessions.is_empty() {
+            println!("  sessions:");
+            for session in &summary.sessions {
+                let projects = if session.projects.is_empty() {
+                    "-".to_string()
+                } else {
+                    session.projects.join(",")
+                };
+                println!(
+                    "    {} calls, first {}, projects {}",
+                    session.calls, session.first_tool, projects
+                );
+            }
+        }
         println!("  by tool:");
         for (tool, count) in &summary.by_tool {
             println!("    {tool}: {count}");
@@ -368,6 +454,16 @@ fn cmd_status(project: Option<&str>, agent_usage: bool, as_json: bool) -> Result
             println!("  common sequences:");
             for (sequence, count) in &summary.common_sequences {
                 println!("    {sequence}: {count}");
+            }
+        }
+        if !summary.by_project.is_empty() {
+            println!("  by project:");
+            for project in &summary.by_project {
+                let name = project.project.as_deref().unwrap_or("(no project)");
+                println!(
+                    "    {name}: {} calls, {} fail, graph {}, search_code {}",
+                    project.calls, project.fail, project.graph_calls, project.text_search_calls
+                );
             }
         }
         return Ok(());
@@ -589,7 +685,8 @@ fn cmd_mcp() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::fold;
+    use super::{fold, Cli, Command, UiAction};
+    use clap::Parser;
 
     #[test]
     fn folding_keeps_every_word_and_respects_the_width() {
@@ -627,5 +724,39 @@ mod tests {
             vec!["alpha beta", "gamma"],
             "words must break only at spaces"
         );
+    }
+
+    #[test]
+    fn loci_ui_stop_is_a_subcommand() {
+        let cli = Cli::try_parse_from(["loci", "ui", "stop"]).expect("parse");
+        match cli.command {
+            Command::Ui {
+                action: Some(UiAction::Stop),
+                bind,
+                port,
+                ..
+            } => {
+                assert_eq!(bind, "127.0.0.1");
+                assert_eq!(port, 7420);
+            }
+            other => panic!("expected ui stop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn loci_ui_without_a_subcommand_still_starts() {
+        let cli = Cli::try_parse_from(["loci", "ui", "--port", "7421", "--no-open"]).expect("parse");
+        match cli.command {
+            Command::Ui {
+                action: None,
+                port,
+                no_open,
+                ..
+            } => {
+                assert_eq!(port, 7421);
+                assert!(no_open);
+            }
+            other => panic!("expected ui start, got {other:?}"),
+        }
     }
 }

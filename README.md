@@ -22,9 +22,9 @@
 Everything runs on your machine. No cloud, no API key, no language runtime. Your source is read,
 parsed, and left where it is — only structure (names, paths, line ranges, relationships) is stored.
 
-![The Loci web UI atlas, call graph of an indexed repository](docs/loci-ui-atlas.png)
+![The Loci web UI atlas: call graph of the loci project](docs/loci-ui-atlas.png)
 
-![The Loci web UI overview: languages, labels, and index counts](docs/loci-ui-overview.png)
+![Day performance: MCP usage for the last 24 hours](docs/loci-ui-performance.png)
 
 **Status: milestone 1, plus the follow-up work.** Indexing, the graph, all 15 MCP tools, the
 Cursor integration, and a local web UI work today. Hybrid LSP is implemented and off by default;
@@ -37,7 +37,7 @@ every edge records whether it came from the AST or from a language server. See
 | --- | --- |
 | Persistent graph | Symbols and edges in `graph.redb`, not a one-shot parse |
 | 15 MCP tools | Structural questions first; grep is the fallback |
-| Local web UI | The same graph in a browser: atlas, routes, coverage, tools |
+| Local web UI | The same graph in a browser: day performance, atlas, routes, coverage, tools |
 | 21 languages | tree-sitter grammars linked into one binary |
 | Incremental index | Unchanged files skipped by content hash |
 
@@ -74,25 +74,32 @@ loci ui
 | --- | --- |
 | `loci install` | Register the server in Cursor's `mcp.json` (and copy the binary if PATH is stale) |
 | `loci index <path>` | Index or re-index a repository (incremental by default, `--full` to force) |
-| `loci status [project]` | Show what is indexed; with no argument, list every project |
+| `loci status [project]` | Show what is indexed; `--agent-usage` summarises the MCP journal |
 | `loci query --project <id>` | Search the graph for symbols |
 | `loci changes --project <id>` | Show which files changed since the last index run |
 | `loci delete <project>` | Delete a project's graph; the source repository is untouched |
 | `loci mcp` | Serve MCP over stdio (Cursor starts this for you) |
 | `loci ui` | Open a local web UI for the graph, per project |
+| `loci ui stop` | Stop the web UI on `--bind`/`--port` (default `127.0.0.1:7420`) |
 
 Add `--json` to any command for machine-readable output.
 
 ## Web UI
 
-`loci ui` serves a page on loopback (`http://127.0.0.1:7420` by default) and opens it in the
-browser. `--bind`, `--port`, and `--no-open` are the only flags. Nothing is uploaded; the process
+`loci ui` (or `loci ui start`) serves a page on loopback (`http://127.0.0.1:7420` by default)
+and opens it in the browser. `--bind`, `--port`, and `--no-open` select the socket. `loci ui stop`
+ends that process and frees the port — including a loci UI that was started before the pid file
+existed. A foreign listener on the same port is left alone. Nothing is uploaded; the process
 reads the same catalog and graph files as `loci mcp`.
 
-From the page you can add a project (an absolute `repo_path`, optional name), switch between
-indexed projects, and:
+The page opens on **Day performance**: last-24-hours or all-journal MCP usage (sessions, graph vs
+grep, paging, freshness, `project_not_found`), split per project. Folder-name aliases such as
+`mcp` are merged into the catalog id.
 
-- walk a force-directed atlas (calls, imports, routes, or a symbol neighbourhood)
+From a project you can:
+
+- walk a force-directed atlas (calls, imports, routes, or a symbol neighbourhood); click a node
+  for its name, file, and degree — there is no side inspector
 - read the architecture counts, HTTP routes, and coverage
 - search symbols, open a snippet, and trace callers
 - invoke any of the 15 MCP tools with the same arguments the agent uses
@@ -108,7 +115,8 @@ Under `$XDG_DATA_HOME/loci` (default `~/.local/share/loci`), never inside your r
 ```
 ~/.local/share/loci/
 ├── catalog.json                    # which projects are indexed, and where
-├── agent_calls.jsonl               # local journal of MCP tool calls
+├── agent_calls.jsonl               # local journal of MCP tool calls (Day performance)
+├── ui.pid                          # pid/bind/port of the running `loci ui`
 └── projects/<project-id>/graph.redb
 ```
 

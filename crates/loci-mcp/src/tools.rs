@@ -124,7 +124,8 @@ pub const TOOLS: &[ToolDef] = &[
                       NEGATIVE OR EXHAUSTIVE CLAIM: a fully skipped file cannot appear in graph \
                       results, so its absence there proves nothing. Returns one of indexed, \
                       parse_partial, skipped or excluded, plus the reason and what to do instead \
-                      (usually: read the source directly). Best-effort by design; `indexed` is not \
+                      (usually: read the source directly). Omit paths and scopes to classify the \
+                      whole project (scope \".\"). Best-effort by design; `indexed` is not \
                       a guarantee of completeness.",
         schema: || {
             json!({
@@ -189,6 +190,10 @@ pub const TOOLS: &[ToolDef] = &[
                         "type": "string",
                         "description": "Exact simple name, case-insensitive. The cheapest lookup."
                     },
+                    "query": {
+                        "type": "string",
+                        "description": "Alias for name, or for name_pattern when the value looks like a regex."
+                    },
                     "qualified_name": {
                         "type": "string",
                         "description": "Exact fully qualified name, e.g. app.service.OrderService.create_order."
@@ -234,6 +239,7 @@ pub const TOOLS: &[ToolDef] = &[
                         "description": "Start-node selector; same fields as search_graph.",
                         "properties": {
                             "name": { "type": "string" },
+                            "query": { "type": "string" },
                             "qualified_name": { "type": "string" },
                             "name_pattern": { "type": "string" },
                             "label": { "type": "string" },
@@ -254,9 +260,13 @@ pub const TOOLS: &[ToolDef] = &[
                                              "ROUTES_TO", "CONFIG_REF", "PROTO_REF", "OPENAPI_REF",
                                              "IMPACTS"]
                                 },
+                                "edge_type": {
+                                    "type": "string",
+                                    "description": "Alias for edge; this is the name get_graph_schema uses."
+                                },
                                 "direction": {
                                     "type": "string",
-                                    "enum": ["out", "in"],
+                                    "enum": ["out", "in", "outbound", "inbound"],
                                     "default": "out",
                                     "description": "out follows the edge forward; in follows it backward."
                                 },
@@ -265,7 +275,7 @@ pub const TOOLS: &[ToolDef] = &[
                                     "description": "Filter the node reached by this hop."
                                 }
                             },
-                            "required": ["edge"],
+                            "required": [],
                             "additionalProperties": false
                         }
                     },
@@ -295,13 +305,17 @@ pub const TOOLS: &[ToolDef] = &[
                         "description": "Exact qualified name from search_graph. Preferred: a bare \
                                         name that matches several symbols returns ambiguous_symbol."
                     },
+                    "from": {
+                        "type": "string",
+                        "description": "Alias for qualified_name."
+                    },
                     "name": {
                         "type": "string",
                         "description": "Simple name, used only when it is unique in the project."
                     },
                     "direction": {
                         "type": "string",
-                        "enum": ["inbound", "outbound", "both"],
+                        "enum": ["inbound", "outbound", "both", "in", "out", "callers", "callees"],
                         "default": "both"
                     },
                     "depth": { "type": "integer", "minimum": 1, "maximum": 10, "default": 3 },
@@ -328,6 +342,10 @@ pub const TOOLS: &[ToolDef] = &[
                         "type": "string",
                         "description": "Exact qualified name from search_graph, or a simple name if unique."
                     },
+                    "name": {
+                        "type": "string",
+                        "description": "Alias for qualified_name when the simple name is unique."
+                    },
                     "context_lines": {
                         "type": "integer",
                         "minimum": 0,
@@ -336,7 +354,7 @@ pub const TOOLS: &[ToolDef] = &[
                         "description": "Extra lines to include before and after the symbol."
                     }
                 },
-                "required": ["project", "qualified_name"],
+                "required": ["project"],
                 "additionalProperties": false
             })
         },
@@ -386,16 +404,21 @@ pub const TOOLS: &[ToolDef] = &[
                 "properties": {
                     "project": project_property(),
                     "pattern": { "type": "string", "description": "Literal text, or a regex when regex=true." },
+                    "query": { "type": "string", "description": "Alias for pattern." },
                     "regex": { "type": "boolean", "default": false },
                     "case_sensitive": { "type": "boolean", "default": true },
                     "file_pattern": {
                         "type": "string",
                         "description": "Regex over the repository-relative file path, e.g. \"\\\\.go$\"."
                     },
+                    "path": {
+                        "type": "string",
+                        "description": "Alias for file_pattern."
+                    },
                     "limit": limit,
                     "cursor": cursor
                 },
-                "required": ["project", "pattern"],
+                "required": ["project"],
                 "additionalProperties": false
             })
         },

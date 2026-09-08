@@ -4,13 +4,21 @@
 //! MCP tools use. It binds loopback by default: the graph never leaves the
 //! machine.
 
+mod service;
 mod ui_graph;
+
+pub use service::{stop, StopOutcome};
 
 use loci_core::{LociError, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::process::Stdio;
+use std::time::Duration;
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
+
+const PORT_TRIES: u16 = 32;
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_CSS: &str = include_str!("../web/app.css");
@@ -22,16 +30,101 @@ pub struct ServeOptions {
     pub open_browser: bool,
 }
 
+pub enum Start {
+    Serving {
+        server: Server,
+        url: String,
+    },
+    /// A loci UI is already bound at `url`. Do not start a second process.
+    Reused {
+        url: String,
+    },
+}
+
 pub fn run(options: &ServeOptions) -> Result<()> {
-    let addr = format!("{}:{}", options.bind, options.port);
-    let server = bind(&addr)?;
-    let bound = display_addr(&server);
-    eprintln!("loci ui listening on {bound}");
-    eprintln!("The graph stays on this machine. Press Ctrl-C to stop.");
-    if options.open_browser {
-        let _ = open_url(&format!("{bound}/"));
+    match start(options)? {
+        Start::Reused { url } => {
+            eprintln!("loci ui already listening on {url}");
+            if options.open_browser {
+                let _ = open_url(&format!("{url}/"));
+            }
+            Ok(())
+        }
+        Start::Serving { server, url } => {
+            eprintln!("loci ui listening on {url}");
+            eprintln!("The graph stays on this machine. Stop with Ctrl-C or: loci ui stop");
+            if options.open_browser {
+                let _ = open_url(&format!("{url}/"));
+            }
+            serve(server)
+        }
     }
-    serve(server)
+}
+
+/// Bind the preferred port, reuse an existing loci UI, or take the next free port.
+pub fn start(options: &ServeOptions) -> Result<Start> {
+    let mut last_error = String::new();
+    for offset in 0..PORT_TRIES {
+        let port = options.port.saturating_add(offset);
+        if port == 0 {
+            break;
+        }
+        let addr = format!("{}:{port}", options.bind);
+        match bind(&addr) {
+            Ok(server) => {
+                let url = display_addr(&server);
+                let (bound, bound_port) = bound_host_port(&server, &options.bind, port);
+                service::write_pid(&service::UiPid {
+                    pid: std::process::id(),
+                    bind: bound,
+                    port: bound_port,
+                    url: url.clone(),
+                })?;
+                return Ok(Start::Serving { server, url });
+            }
+            Err(error) => {
+                last_error = error.to_string();
+                if !is_addr_in_use(&last_error) {
+                    return Err(error);
+                }
+                if probe_loci_ui(&options.bind, port) {
+                    return Ok(Start::Reused {
+                        url: format!("http://{}:{port}", options.bind),
+                    });
+                }
+            }
+        }
+    }
+    Err(LociError::InvalidArgument(format!(
+        "cannot bind {} from port {} (tried {PORT_TRIES} ports): {last_error}",
+        options.bind, options.port
+    )))
+}
+
+fn is_addr_in_use(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("already in use")
+        || lower.contains("os error 98")
+        || lower.contains("os error 10048")
+}
+
+/// True when `host:port` answers `/api/health` as this binary.
+fn probe_loci_ui(host: &str, port: u16) -> bool {
+    let Ok(mut stream) = TcpStream::connect((host, port)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(400)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(400)));
+    let request =
+        format!("GET /api/health HTTP/1.0\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buf = String::new();
+    if stream.read_to_string(&mut buf).is_err() {
+        return false;
+    }
+    buf.contains("\"server\":\"loci-ui\"") || buf.contains("\"server\": \"loci-ui\"")
 }
 
 pub fn bind(addr: &str) -> Result<Server> {
@@ -53,6 +146,13 @@ pub fn display_addr(server: &Server) -> String {
     match server.server_addr().to_ip() {
         Some(addr) => format!("http://{addr}"),
         None => "http://127.0.0.1".to_string(),
+    }
+}
+
+fn bound_host_port(server: &Server, fallback_bind: &str, fallback_port: u16) -> (String, u16) {
+    match server.server_addr().to_ip() {
+        Some(addr) => (addr.ip().to_string(), addr.port()),
+        None => (fallback_bind.to_string(), fallback_port),
     }
 }
 
@@ -114,10 +214,14 @@ pub fn dispatch(method: &str, path: &str, query: &str, body: &[u8]) -> HttpOut {
             "version": env!("CARGO_PKG_VERSION"),
         })),
         ("GET", "/api/tools") => json_ok(loci_mcp::tools::tool_list()),
-        ("GET", "/api/usage") => match loci_mcp::journal::summarise() {
-            Ok(summary) => json_ok(serde_json::to_value(summary).unwrap_or(json!({}))),
-            Err(error) => json_err(&error),
-        },
+        ("GET", "/api/usage") => {
+            let params = query_map(query);
+            let window = params.get("window").map(String::as_str).unwrap_or("all");
+            match loci_mcp::journal::summarise_window(window) {
+                Ok(summary) => json_ok(serde_json::to_value(summary).unwrap_or(json!({}))),
+                Err(error) => json_err(&error),
+            }
+        }
         ("GET", path) if project_graph_id(path).is_some() => {
             let project = project_graph_id(path).expect("checked");
             let params = query_map(query);
@@ -368,6 +472,95 @@ mod tests {
             "the project list must expose a remove control for an added project"
         );
         assert!(html.contains("Remove project"));
+        assert!(
+            html.contains("Day performance") && html.contains("nav-performance"),
+            "the rail must expose the global day-performance view"
+        );
+        assert!(
+            js.contains("openPerformance") && js.contains("/api/usage?window="),
+            "boot must open the global performance report"
+        );
+        assert!(
+            js.contains("renderProjectUsage") && js.contains("successRate(p.ok, p.calls)"),
+            "a project's Usage tab must use that project's ok/calls, not the global totals"
+        );
+        assert!(
+            js.contains("data-window")
+                && js.contains("u.sessions")
+                && js.contains("detect_changes")
+                && js.contains("project_not_found"),
+            "Day performance must expose a day/all window, the session list, freshness, and wrong project ids"
+        );
+        assert!(
+            !js.contains("id=\"inspector\"") && !js.contains("<h2>Inspector</h2>"),
+            "Atlas must not reserve a right-hand Inspector panel"
+        );
+        assert!(
+            js.contains("atlas-tip") && js.contains("showAtlasTip"),
+            "clicking an Atlas node must show a tip with that node's identity"
+        );
+    }
+
+    #[test]
+    fn usage_endpoint_reports_global_and_per_project_totals() {
+        let _lock = serial();
+        let journal = data_dir().join("agent_calls.jsonl");
+        std::fs::write(
+            &journal,
+            r#"{"at_unix":100,"tool":"list_projects","argument_keys":[],"duration_ms":0,"ok":true}
+{"at_unix":101,"tool":"search_graph","argument_keys":["name","project"],"project":"alpha","duration_ms":12,"ok":true,"has_more":true}
+{"at_unix":102,"tool":"search_graph","argument_keys":["cursor","name","project"],"project":"alpha","duration_ms":9,"ok":true}
+{"at_unix":103,"tool":"trace_path","argument_keys":["from","project"],"project":"alpha","duration_ms":11,"ok":false,"error_code":"invalid_argument"}
+"#,
+        )
+        .expect("write journal");
+
+        let out = dispatch("GET", "/api/usage", "", b"");
+        let body = json_body(&out);
+        assert_eq!(out.status, 200, "{body}");
+        assert_eq!(body["total_calls"], 4);
+        assert_eq!(body["fail"], 1);
+        assert!(body["by_project"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["project"] == "alpha"));
+        assert_eq!(body["criteria"]["walk_failures"], 1);
+        assert_eq!(body["paged_followthrough"], 1);
+        assert_eq!(body["window"], "all");
+        assert_eq!(body["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(body["sessions"][0]["first_tool"], "list_projects");
+    }
+
+    #[test]
+    fn usage_day_window_excludes_calls_older_than_24_hours() {
+        let _lock = serial();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let journal = data_dir().join("agent_calls.jsonl");
+        std::fs::write(
+            &journal,
+            format!(
+                r#"{{"at_unix":{},"tool":"search_graph","argument_keys":["project"],"project":"old","duration_ms":1,"ok":true}}
+{{"at_unix":{},"tool":"list_projects","argument_keys":[],"duration_ms":1,"ok":true}}
+"#,
+                now - 100_000,
+                now - 60
+            ),
+        )
+        .expect("write journal");
+
+        let day = dispatch("GET", "/api/usage", "window=day", b"");
+        let day = json_body(&day);
+        assert_eq!(day["window"], "day", "{day}");
+        assert_eq!(day["total_calls"], 1, "{day}");
+        assert_eq!(day["by_tool"]["list_projects"], 1, "{day}");
+        assert!(day["by_tool"].get("search_graph").is_none(), "{day}");
+
+        let all = json_body(&dispatch("GET", "/api/usage", "window=all", b""));
+        assert_eq!(all["total_calls"], 2, "{all}");
     }
 
     #[test]
@@ -565,5 +758,107 @@ mod tests {
         stream.read_to_string(&mut buf).expect("read");
         assert!(buf.contains("Loci"), "{buf}");
         assert!(buf.contains("200 OK"), "{buf}");
+    }
+
+    #[test]
+    fn a_second_loci_ui_reuses_the_instance_already_on_the_port() {
+        let _lock = serial();
+        let server = bind("127.0.0.1:0").expect("bind");
+        let addr = bound_socket(&server).expect("tcp addr");
+        std::thread::spawn(move || {
+            let _ = serve(server);
+        });
+
+        let started = start(&ServeOptions {
+            bind: "127.0.0.1".into(),
+            port: addr.port(),
+            open_browser: false,
+        })
+        .expect("reuse");
+        match started {
+            Start::Reused { url } => {
+                assert!(
+                    url.ends_with(&format!(":{}", addr.port())),
+                    "must point at the live instance: {url}"
+                );
+            }
+            Start::Serving { url, .. } => {
+                panic!("must not bind a second server when loci ui is already up: {url}")
+            }
+        }
+    }
+
+    #[test]
+    fn start_writes_a_pid_file_for_the_bound_socket() {
+        let _lock = serial();
+        let isolated = tempfile::tempdir().expect("isolated data dir");
+        std::env::set_var("LOCI_DATA_DIR", isolated.path());
+        let started = start(&ServeOptions {
+            bind: "127.0.0.1".into(),
+            port: 49152,
+            open_browser: false,
+        })
+        .expect("start");
+        let record = service::read_pid().expect("read").expect("pid file");
+        std::env::set_var("LOCI_DATA_DIR", data_dir());
+        match started {
+            Start::Serving { url, server } => {
+                let bound = bound_socket(&server).expect("tcp addr").port();
+                assert_eq!(
+                    record.port, bound,
+                    "pid file must record the socket that is actually listening"
+                );
+                assert_eq!(record.pid, std::process::id());
+                assert!(url.ends_with(&format!(":{bound}")), "{url}");
+            }
+            Start::Reused { url } => panic!("expected a new bind, reused {url}"),
+        }
+    }
+
+    #[test]
+    fn a_stale_pid_file_is_not_treated_as_a_running_ui() {
+        let _lock = serial();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("pick port");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        service::write_pid(&service::UiPid {
+            pid: 4_294_967_295,
+            bind: "127.0.0.1".into(),
+            port,
+            url: format!("http://127.0.0.1:{port}"),
+        })
+        .expect("write stale pid");
+        match stop("127.0.0.1", port).expect("stop") {
+            StopOutcome::NotRunning {
+                port: stopped,
+                ..
+            } => assert_eq!(stopped, port),
+            StopOutcome::Stopped { pid, .. } => {
+                panic!("must not signal pid {pid} from a stale record")
+            }
+        }
+    }
+
+    #[test]
+    fn a_foreign_process_on_the_port_does_not_block_loci_ui() {
+        let _lock = serial();
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").expect("occupy");
+        let taken = occupied.local_addr().expect("addr").port();
+
+        let started = start(&ServeOptions {
+            bind: "127.0.0.1".into(),
+            port: taken,
+            open_browser: false,
+        })
+        .expect("next port");
+        match started {
+            Start::Serving { url, .. } => {
+                assert!(
+                    !url.ends_with(&format!(":{taken}")),
+                    "must not steal the occupied port: {url}"
+                );
+            }
+            Start::Reused { url } => panic!("a raw listener is not a loci UI: {url}"),
+        }
     }
 }

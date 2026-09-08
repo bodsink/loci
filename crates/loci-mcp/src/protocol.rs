@@ -19,13 +19,15 @@ loci answers structural questions about code from a persistent local graph.
 
 Order of operations:
 1. list_projects — get the exact `project` id. Never guess it from a directory name.
-2. index_repository — only when the repository you need is absent, or index_status shows it is stale.
+2. index_repository — only when the repository you need is absent, or detect_changes /
+   index_status shows the working tree has drifted.
 3. search_graph / query_graph / trace_path — structural discovery. Prefer these over grep.
 4. get_code_snippet — read exact source once you have a qualified_name from search_graph.
 5. search_code — literal or regex text only, or when graph coverage is insufficient.
 
 Rules:
 - Every tool needs `project`. Take it from list_projects.
+- After an edit, call detect_changes before trusting a previous graph answer.
 - Responses are paginated. When has_more is true, page with the returned cursor before concluding.
 - Before any negative or exhaustive claim (\"X does not exist\", \"nothing calls Y\"), call
   check_index_coverage for the paths or scopes involved. Coverage is best-effort and never proves
@@ -183,10 +185,9 @@ mod tests {
         assert_eq!(result["protocolVersion"], "2025-06-18");
         assert_eq!(result["serverInfo"]["name"], "loci");
         assert!(result["capabilities"]["tools"].is_object());
-        assert!(result["instructions"]
-            .as_str()
-            .unwrap()
-            .contains("list_projects"));
+        let instructions = result["instructions"].as_str().unwrap();
+        assert!(instructions.contains("list_projects"));
+        assert!(instructions.contains("detect_changes"));
     }
 
     #[test]

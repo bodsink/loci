@@ -66,6 +66,36 @@ impl Catalog {
             .ok_or_else(|| LociError::ProjectNotFound(id.to_string()))
     }
 
+    /// Resolve a `project` argument the way an agent actually sends it.
+    ///
+    /// Exact catalog id wins. If that misses, a unique display name or a unique
+    /// repository-root basename is accepted — that is the id `index_repository`
+    /// would have allocated without a `name` override. Two matches stay
+    /// `project_not_found`; guessing among them would be a lie.
+    pub fn resolve(&self, id: &str) -> Result<&ProjectEntry> {
+        if let Some(entry) = self.get(id) {
+            return Ok(entry);
+        }
+        let by_name: Vec<&ProjectEntry> = self.projects.iter().filter(|p| p.name == id).collect();
+        if by_name.len() == 1 {
+            return Ok(by_name[0]);
+        }
+        let by_basename: Vec<&ProjectEntry> = self
+            .projects
+            .iter()
+            .filter(|p| {
+                Path::new(&p.root)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    == Some(id)
+            })
+            .collect();
+        if by_basename.len() == 1 {
+            return Ok(by_basename[0]);
+        }
+        Err(LociError::ProjectNotFound(id.to_string()))
+    }
+
     pub fn find_by_root(&self, root: &Path) -> Option<&ProjectEntry> {
         let root = root.to_string_lossy();
         self.projects.iter().find(|p| p.root == root)
@@ -161,6 +191,29 @@ mod tests {
     fn requiring_an_unknown_project_is_explicit() {
         let catalog = Catalog::default();
         let err = catalog.require("nope").unwrap_err();
+        assert_eq!(err.code(), "project_not_found");
+    }
+
+    #[test]
+    fn resolve_accepts_a_unique_root_basename() {
+        let mut catalog = Catalog::default();
+        catalog.upsert(ProjectEntry {
+            id: "loci".into(),
+            name: "loci".into(),
+            root: "/home/you/Project/mcp".into(),
+            store_path: "/data/loci/graph.redb".into(),
+            indexed_at_unix: 0,
+        });
+        assert_eq!(catalog.resolve("mcp").unwrap().id, "loci");
+        assert_eq!(catalog.resolve("loci").unwrap().id, "loci");
+    }
+
+    #[test]
+    fn resolve_does_not_guess_when_two_roots_share_a_basename() {
+        let mut catalog = Catalog::default();
+        catalog.upsert(entry("one", "/tmp/a/mcp"));
+        catalog.upsert(entry("two", "/tmp/b/mcp"));
+        let err = catalog.resolve("mcp").unwrap_err();
         assert_eq!(err.code(), "project_not_found");
     }
 }
