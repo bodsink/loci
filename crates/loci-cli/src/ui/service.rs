@@ -125,7 +125,8 @@ fn resolve_pid(bind: &str, port: u16) -> Result<StopTarget> {
 fn port_in_use(bind: &str, port: u16) -> bool {
     std::net::TcpStream::connect_timeout(
         &std::net::SocketAddr::new(
-            bind.parse().unwrap_or(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            bind.parse()
+                .unwrap_or(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)),
             port,
         ),
         Duration::from_millis(150),
@@ -235,7 +236,10 @@ fn listen_inode(bind: &str, port: u16) -> Option<u64> {
 
 fn ipv4_listen_key(ip: Ipv4Addr, port: u16) -> String {
     let o = ip.octets();
-    format!("{:02X}{:02X}{:02X}{:02X}:{port:04X}", o[3], o[2], o[1], o[0])
+    format!(
+        "{:02X}{:02X}{:02X}{:02X}:{port:04X}",
+        o[3], o[2], o[1], o[0]
+    )
 }
 
 fn listen_inode_in(path: &str, local: &str) -> Option<u64> {
@@ -277,9 +281,8 @@ fn fd_dir_has_socket(fd_dir: &Path, needle: &str) -> bool {
     let Ok(fds) = std::fs::read_dir(fd_dir) else {
         return false;
     };
-    fds.flatten().any(|fd| {
-        std::fs::read_link(fd.path()).is_ok_and(|target| target == Path::new(needle))
-    })
+    fds.flatten()
+        .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|target| target == Path::new(needle)))
 }
 
 fn find_listener_via_ss(bind: &str, port: u16) -> Option<u32> {

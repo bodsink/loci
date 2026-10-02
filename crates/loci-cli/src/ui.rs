@@ -829,10 +829,7 @@ mod tests {
         })
         .expect("write stale pid");
         match stop("127.0.0.1", port).expect("stop") {
-            StopOutcome::NotRunning {
-                port: stopped,
-                ..
-            } => assert_eq!(stopped, port),
+            StopOutcome::NotRunning { port: stopped, .. } => assert_eq!(stopped, port),
             StopOutcome::Stopped { pid, .. } => {
                 panic!("must not signal pid {pid} from a stale record")
             }
