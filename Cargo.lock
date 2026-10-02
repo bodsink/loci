@@ -417,11 +417,13 @@ dependencies = [
 name = "loci-mcp"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "loci-core",
  "loci-graph",
  "loci-index",
  "loci-lsp",
  "loci-parse",
+ "rayon",
  "regex",
  "serde",
  "serde_json",

@@ -30,10 +30,13 @@ It has your open files and its own search tools. It does not know Loci exists un
 tool list, and it does not know which repositories have graphs.
 
 **Design response.** The `initialize` response ships `instructions` that state the order of
-operations explicitly: `list_projects` first, then index if needed, then structural discovery. Every
-tool that needs a project says in its schema that the id comes from `list_projects` and is *not* a
-directory name. When `list_projects` returns nothing, the response includes a `next_step` string
-telling the agent to call `index_repository` with an absolute path.
+operations explicitly: `list_projects` first, then index if the repository is absent, then
+structural discovery. A project that is already listed is refreshed by the server itself before
+the next project tool, when a watched file was added, removed, or its mtime changed. The agent
+does not have to call `index_repository` to pick up an edit. Every tool that needs a project says
+in its schema that the id comes from `list_projects` and is *not* a directory name. When
+`list_projects` returns nothing, the response includes a `next_step` string telling the agent to
+call `index_repository` with an absolute path.
 
 ### 2. The agent defaults to grep
 
@@ -129,8 +132,8 @@ empirical rather than speculative.
 
 - Whether the `instructions` field measurably changes Cursor's tool selection. It is part of the
   MCP spec and Cursor accepts it, but its influence on the model has not been measured here.
-- Long-session behaviour: whether the agent re-checks coverage after an edit, or trusts a graph
-  that has gone stale. `detect_changes` exists for this, but no data yet shows the agent using it
-  unprompted.
+- Long-session behaviour of the model itself. The server now refreshes a listed project before
+  a project tool when a watched file changes, because the journal showed agents do not call
+  `index_repository` on their own. `detect_changes` still reports the drift.
 - Behaviour in MCP clients other than Cursor. The protocol implementation is spec-conformant and
   client-agnostic, but only Cursor has been exercised.

@@ -426,6 +426,11 @@ pub struct FileRecord {
     pub detail: Option<String>,
     #[serde(default)]
     pub node_ids: Vec<u64>,
+    /// mtime in nanoseconds since the unix epoch, taken when this record was
+    /// written. Zero means the record predates that field: the next index
+    /// hashes the file once and stores the mtime, and later runs trust it.
+    #[serde(default)]
+    pub mtime_ns: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -448,6 +453,10 @@ pub struct ProjectMeta {
     /// the id space, resolved edges from the bottom half.
     #[serde(default = "default_structural_edge_id")]
     pub next_structural_edge_id: u32,
+    /// True once `label_order` covers every node. Older graphs read as false
+    /// and keep scanning until the next index fills the index.
+    #[serde(default)]
+    pub label_order: bool,
 }
 
 /// First id in the structural half of the edge id space.
@@ -473,6 +482,7 @@ impl ProjectMeta {
             next_node_id: 1,
             next_edge_id: 1,
             next_structural_edge_id: STRUCTURAL_EDGE_ID_BASE,
+            label_order: false,
         }
     }
 }

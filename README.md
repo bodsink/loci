@@ -61,19 +61,25 @@ binary if you built on a machine that never produced a release `loci` here). Oth
 that file are left alone. If `~/.local/bin` is not on `PATH`, `install` says so and prints the
 line to add.
 
-Then index a repository and reload MCP servers in Cursor (Settings → MCP → refresh):
+Index a repository once, then reload MCP servers in Cursor (Settings → MCP → refresh):
 
 ```bash
 loci index /path/to/your/repo
 loci ui
 ```
 
+That first `loci index` is the manual step: it creates the project. After the server is reloaded,
+a project that is already listed is refreshed by `loci mcp` itself before the next project tool,
+when a file was added, removed, or its mtime changed. The agent does not have to call
+`index_repository` after an edit. `loci index` remains the way to refresh from the shell, and a
+tree whose size and mtime still match does not reload the graph.
+
 ## CLI
 
 | Command | What it does |
 | --- | --- |
 | `loci install` | Register the server in Cursor's `mcp.json` (and copy the binary if PATH is stale) |
-| `loci index <path>` | Index or re-index a repository (incremental by default, `--full` to force) |
+| `loci index <path>` | Index or re-index a repository (incremental by default, `--full` to force). Cursor refreshes a listed project on its own |
 | `loci status [project]` | Show what is indexed; `--agent-usage` summarises the MCP journal |
 | `loci query --project <id>` | Search the graph for symbols |
 | `loci changes --project <id>` | Show which files changed since the last index run |

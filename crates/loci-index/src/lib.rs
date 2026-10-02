@@ -3,9 +3,10 @@
 //! An index run is two phases. First every changed file is parsed in parallel
 //! and its symbols are written. Then, with the whole project's symbols known,
 //! cross-file edges (calls, imports, inheritance, routes) are rebuilt from the
-//! per-file facts stored on disk. The second phase runs even for an incremental
-//! update, so an edge from an untouched file into a symbol that just moved is
-//! still correct.
+//! per-file facts stored on disk. The second phase runs when a file was added,
+//! removed, or its contents changed, so an edge from an untouched file into a
+//! symbol that just moved is still correct. A tree whose size and mtime still
+//! match the stored records does not load the graph.
 
 pub mod changes;
 pub mod hybrid;
@@ -128,6 +129,7 @@ struct FileOutcome {
     reason: Option<CoverageReason>,
     detail: Option<String>,
     line_count: u32,
+    mtime_ns: u64,
     extracted: Option<loci_parse::ExtractedFile>,
 }
 
@@ -286,6 +288,7 @@ fn process_file(candidate: &Candidate) -> FileOutcome {
         reason: None,
         detail: None,
         line_count: 0,
+        mtime_ns: candidate.mtime_ns,
         extracted: None,
     };
 
@@ -296,6 +299,11 @@ fn process_file(candidate: &Candidate) -> FileOutcome {
             candidate.size,
             loci_core::MAX_FILE_BYTES
         ));
+        // A hash is what lets the next run skip this file. Leaving it empty
+        // makes every later index treat the file as new and rebuild edges.
+        if let Ok(bytes) = std::fs::read(&candidate.absolute_path) {
+            outcome.hash = content_hash(&bytes);
+        }
         return outcome;
     }
 
@@ -355,6 +363,75 @@ fn process_file(candidate: &Candidate) -> FileOutcome {
     }
 
     outcome
+}
+
+struct UnchangedIdentity<'a> {
+    project: &'a str,
+    root: String,
+    store_path: &'a Path,
+    name_note: Option<String>,
+    meta: &'a ProjectMeta,
+}
+
+/// Report for a run that found no added, removed, or content-changed file.
+///
+/// Counts come from the records already loaded during the hash phase, so this
+/// does not open the node or edge tables.
+fn report_when_unchanged(
+    started: Instant,
+    phase_ms: PhaseTimings,
+    unchanged: usize,
+    previous: &HashMap<String, FileRecord>,
+    id: &UnchangedIdentity<'_>,
+) -> IndexReport {
+    let mut files_indexed = 0usize;
+    let mut parse_partial: Vec<&FileRecord> = Vec::new();
+    let mut skipped: Vec<FileRecord> = Vec::new();
+    for record in previous.values() {
+        match record.status {
+            CoverageStatus::Indexed => files_indexed += 1,
+            CoverageStatus::ParsePartial => parse_partial.push(record),
+            CoverageStatus::Skipped => skipped.push(record.clone()),
+            CoverageStatus::Excluded => {}
+        }
+    }
+
+    IndexReport {
+        project: id.project.to_string(),
+        root: id.root.clone(),
+        store_path: id.store_path.to_string_lossy().to_string(),
+        duration_ms: started.elapsed().as_millis() as u64,
+        nodes: id.meta.node_count,
+        edges: id.meta.edge_count,
+        files_indexed,
+        files_parse_partial: parse_partial.len(),
+        files_skipped: skipped.len(),
+        files_reparsed: 0,
+        files_unchanged: unchanged,
+        files_removed: 0,
+        languages: id.meta.languages.clone(),
+        parse_partial_examples: parse_partial
+            .iter()
+            .take(EXAMPLE_CAP)
+            .map(|f| match &f.detail {
+                Some(detail) => format!("{} ({detail})", f.path),
+                None => f.path.clone(),
+            })
+            .collect(),
+        skipped_examples: loci_graph::coverage::sample_files(&skipped, EXAMPLE_CAP)
+            .into_iter()
+            .map(|s| CoverageExample {
+                path: s.file.path.clone(),
+                reason: s.file.reason.map_or("unknown", CoverageReason::as_str),
+                others_like_it: s.others_like_it,
+            })
+            .collect(),
+        bundled_languages: id.meta.bundled_languages.clone(),
+        hybrid_lsp: hybrid::HybridReport::disabled(),
+        name_note: id.name_note.clone(),
+        phase_ms,
+        coverage_note: COVERAGE_NOTE,
+    }
 }
 
 /// Index a repository into its own persistent graph.
@@ -424,8 +501,21 @@ pub fn index_repository(root: &Path, options: &IndexOptions) -> Result<IndexRepo
     let phase_started = Instant::now();
     let mut to_process: Vec<&Candidate> = Vec::new();
     let mut unchanged: Vec<&Candidate> = Vec::new();
+    // Records written before mtime was stored still hash once. The matching
+    // hash is then paired with the current mtime so the next run can skip
+    // the read.
+    let mut stamp_mtime: Vec<(&str, u64)> = Vec::new();
     for candidate in &candidates {
         match previous.get(&candidate.relative_path) {
+            Some(record)
+                if !full
+                    && record.mtime_ns != 0
+                    && record.mtime_ns == candidate.mtime_ns
+                    && record.size == candidate.size
+                    && !record.hash.is_empty() =>
+            {
+                unchanged.push(candidate);
+            }
             Some(record) if !full && record.size == candidate.size && !record.hash.is_empty() => {
                 // Size match is a cheap gate; the hash check below is decisive.
                 let current = std::fs::read(&candidate.absolute_path)
@@ -433,6 +523,9 @@ pub fn index_repository(root: &Path, options: &IndexOptions) -> Result<IndexRepo
                     .unwrap_or_default();
                 if current == record.hash {
                     unchanged.push(candidate);
+                    if record.mtime_ns == 0 && candidate.mtime_ns != 0 {
+                        stamp_mtime.push((candidate.relative_path.as_str(), candidate.mtime_ns));
+                    }
                 } else {
                     to_process.push(candidate);
                 }
@@ -441,10 +534,15 @@ pub fn index_repository(root: &Path, options: &IndexOptions) -> Result<IndexRepo
         }
     }
 
-    phase_ms.hash = phase_started.elapsed().as_millis() as u64;
+    if !stamp_mtime.is_empty() {
+        let writer = store.write()?;
+        for (path, mtime_ns) in &stamp_mtime {
+            writer.set_file_mtime(path, *mtime_ns)?;
+        }
+        writer.commit()?;
+    }
 
-    let phase_started = Instant::now();
-    let outcomes: Vec<FileOutcome> = to_process.par_iter().map(|c| process_file(c)).collect();
+    phase_ms.hash = phase_started.elapsed().as_millis() as u64;
 
     let seen: std::collections::HashSet<&str> = candidates
         .iter()
@@ -455,6 +553,30 @@ pub fn index_repository(root: &Path, options: &IndexOptions) -> Result<IndexRepo
         .filter(|path| !seen.contains(path.as_str()))
         .cloned()
         .collect();
+
+    // Nothing to parse and nothing deleted: skip the symbol rewrite and the
+    // project-wide fact load. Those dominate a clean `loci index` once the
+    // graph is large.
+    if !full && to_process.is_empty() && removed.is_empty() {
+        if let Some(meta) = existing_meta.as_ref().filter(|meta| meta.label_order) {
+            return Ok(report_when_unchanged(
+                started,
+                phase_ms,
+                unchanged.len(),
+                &previous,
+                &UnchangedIdentity {
+                    project: &project_id,
+                    root: root_display,
+                    store_path: &store_path,
+                    name_note,
+                    meta,
+                },
+            ));
+        }
+    }
+
+    let phase_started = Instant::now();
+    let outcomes: Vec<FileOutcome> = to_process.par_iter().map(|c| process_file(c)).collect();
 
     let mut next_node_id = existing_meta.as_ref().map_or(1, |m| m.next_node_id).max(1);
     let mut next_edge_id = existing_meta.as_ref().map_or(1, |m| m.next_edge_id).max(1);
@@ -599,6 +721,14 @@ pub fn index_repository(root: &Path, options: &IndexOptions) -> Result<IndexRepo
 
     let duration_ms = started.elapsed().as_millis() as u64;
 
+    let label_order_ready = existing_meta.as_ref().is_some_and(|meta| meta.label_order);
+    if !full && !label_order_ready {
+        let nodes = store.read()?.all_nodes()?;
+        let writer = store.write()?;
+        writer.rebuild_label_order(&nodes)?;
+        writer.commit()?;
+    }
+
     {
         let writer = store.write()?;
         let mut meta = ProjectMeta::new(project_id.clone(), root_display.clone());
@@ -615,6 +745,7 @@ pub fn index_repository(root: &Path, options: &IndexOptions) -> Result<IndexRepo
         meta.next_node_id = next_node_id;
         meta.next_edge_id = next_edge_id;
         meta.next_structural_edge_id = next_structural_edge_id;
+        meta.label_order = true;
         writer.put_meta(&meta)?;
         writer.commit()?;
     }
@@ -716,6 +847,7 @@ fn write_file_symbols(
         reason: outcome.reason,
         detail: outcome.detail.clone(),
         node_ids: Vec::new(),
+        mtime_ns: outcome.mtime_ns,
     };
 
     let Some(extracted) = &outcome.extracted else {
@@ -1452,6 +1584,50 @@ struct ResolvedEdges {
 
 /// Open the graph for a project id, failing explicitly when it is missing.
 ///
+/// Re-index `project` when a file was added, removed, or its size or mtime
+/// changed. Returns whether an index run happened.
+///
+/// A tree whose stored mtimes still match is left untouched: no file bytes
+/// are read. Records with `mtime_ns == 0` count as stale so the first call
+/// after an upgrade stores mtimes and builds the label index.
+pub fn refresh_if_stale(project: &str) -> Result<bool> {
+    let (entry, store) = open_project(project)?;
+    let root = entry.root.clone();
+    let recorded = store.read()?.all_files()?;
+    drop(store);
+
+    let sandbox = Sandbox::new(Path::new(&root))?;
+    let candidates = walk::collect(&sandbox);
+    let recorded_by_path: HashMap<&str, &FileRecord> = recorded
+        .iter()
+        .map(|record| (record.path.as_str(), record))
+        .collect();
+
+    let current = candidates.len() == recorded_by_path.len()
+        && candidates.iter().all(|candidate| {
+            recorded_by_path
+                .get(candidate.relative_path.as_str())
+                .is_some_and(|record| {
+                    record.mtime_ns != 0
+                        && record.mtime_ns == candidate.mtime_ns
+                        && record.size == candidate.size
+                })
+        });
+    if current {
+        return Ok(false);
+    }
+
+    index_repository(
+        Path::new(&root),
+        &IndexOptions {
+            name: None,
+            full: false,
+            hybrid_lsp: false,
+        },
+    )?;
+    Ok(true)
+}
+
 /// Shared read lock: the UI and MCP can inspect the same project at once.
 /// Use [`open_project_write`] for ADR/trace writes; indexing opens the store
 /// exclusively itself.

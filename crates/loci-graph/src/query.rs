@@ -92,6 +92,22 @@ fn literal_prefix(pattern: &str) -> String {
     prefix
 }
 
+fn nodes_for_file_pattern(
+    reader: &GraphReader,
+    prefix: &str,
+    file_regex: Option<&regex::Regex>,
+) -> Result<Vec<Node>> {
+    let Some(file_regex) = file_regex else {
+        return reader.all_nodes();
+    };
+    let paths = reader.file_paths_with_prefix(prefix)?;
+    let paths: Vec<String> = paths
+        .into_iter()
+        .filter(|path| file_regex.is_match(path))
+        .collect();
+    reader.nodes_in_paths(&paths)
+}
+
 pub fn search(reader: &GraphReader, request: &SearchRequest) -> Result<SearchResponse> {
     let label = match &request.label {
         Some(l) => Some(
@@ -117,6 +133,39 @@ pub fn search(reader: &GraphReader, request: &SearchRequest) -> Result<SearchRes
         None => None,
     };
 
+    let file_prefix = request
+        .file_pattern
+        .as_deref()
+        .map(literal_prefix)
+        .unwrap_or_default();
+
+    // A label with no name and no path is a range over the label index.
+    // Anything else that would otherwise scan every node is limited to the
+    // files the path regex can name.
+    if request.qualified_name.is_none()
+        && request.name.is_none()
+        && request.name_pattern.is_none()
+        && request.file_pattern.is_none()
+        && reader.meta()?.is_some_and(|meta| meta.label_order)
+    {
+        if let Some(label) = label {
+            let offset = request.offset.unwrap_or(0);
+            let limit = request.limit.unwrap_or(50).clamp(1, 1000);
+            let (page, total) = reader.label_page(label.as_str(), offset, limit)?;
+            let has_more = offset + page.len() < total;
+            let mut results = Vec::with_capacity(page.len());
+            for node in &page {
+                results.push(to_hit(reader, node)?);
+            }
+            return Ok(SearchResponse {
+                results,
+                total,
+                has_more,
+                cursor: has_more.then(|| (offset + page.len()).to_string()),
+            });
+        }
+    }
+
     // Candidate selection, cheapest strategy first.
     let mut candidates = if let Some(qn) = &request.qualified_name {
         reader.nodes_by_qualified_name(qn)?
@@ -125,10 +174,12 @@ pub fn search(reader: &GraphReader, request: &SearchRequest) -> Result<SearchRes
     } else if let Some(pattern) = &request.name_pattern {
         let prefix = literal_prefix(pattern);
         if prefix.is_empty() {
-            reader.all_nodes()?
+            nodes_for_file_pattern(reader, &file_prefix, file_regex.as_ref())?
         } else {
             reader.nodes_by_name_prefix(&prefix, PREFIX_SCAN_CAP)?
         }
+    } else if request.file_pattern.is_some() {
+        nodes_for_file_pattern(reader, &file_prefix, file_regex.as_ref())?
     } else {
         reader.all_nodes()?
     };

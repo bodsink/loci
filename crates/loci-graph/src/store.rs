@@ -22,6 +22,8 @@ const CALLSITES: TableDefinition<&str, &[u8]> = TableDefinition::new("callsites"
 const QN_INDEX: MultimapTableDefinition<&str, u64> = MultimapTableDefinition::new("qn_idx");
 const NAME_INDEX: MultimapTableDefinition<&str, u64> = MultimapTableDefinition::new("name_idx");
 const FILE_INDEX: MultimapTableDefinition<&str, u64> = MultimapTableDefinition::new("file_idx");
+/// Nodes of one label in `search` order: label, qualified name, path, line.
+const LABEL_ORDER: MultimapTableDefinition<&str, u64> = MultimapTableDefinition::new("label_order");
 const ADJ_OUT: MultimapTableDefinition<u64, u128> = MultimapTableDefinition::new("adj_out");
 const ADJ_IN: MultimapTableDefinition<u64, u128> = MultimapTableDefinition::new("adj_in");
 
@@ -115,6 +117,7 @@ impl GraphStore {
             tx.open_multimap_table(QN_INDEX).map_err(storage)?;
             tx.open_multimap_table(NAME_INDEX).map_err(storage)?;
             tx.open_multimap_table(FILE_INDEX).map_err(storage)?;
+            tx.open_multimap_table(LABEL_ORDER).map_err(storage)?;
             tx.open_multimap_table(ADJ_OUT).map_err(storage)?;
             tx.open_multimap_table(ADJ_IN).map_err(storage)?;
         }
@@ -179,6 +182,12 @@ impl GraphWriter {
             let mut files = self.tx.open_multimap_table(FILE_INDEX).map_err(storage)?;
             files
                 .insert(node.file_path.as_str(), node.id)
+                .map_err(storage)?;
+        }
+        {
+            let mut labels = self.tx.open_multimap_table(LABEL_ORDER).map_err(storage)?;
+            labels
+                .insert(label_order_key(node).as_str(), node.id)
                 .map_err(storage)?;
         }
         Ok(())
@@ -261,6 +270,7 @@ impl GraphWriter {
             let mut nodes = self.tx.open_table(NODES).map_err(storage)?;
             let mut qn = self.tx.open_multimap_table(QN_INDEX).map_err(storage)?;
             let mut names = self.tx.open_multimap_table(NAME_INDEX).map_err(storage)?;
+            let mut labels = self.tx.open_multimap_table(LABEL_ORDER).map_err(storage)?;
             for node_id in &node_ids {
                 if let Some(raw) = nodes.remove(*node_id).map_err(storage)? {
                     let node: Node = serde_json::from_slice(raw.value()).map_err(storage)?;
@@ -268,6 +278,9 @@ impl GraphWriter {
                         .map_err(storage)?;
                     names
                         .remove(node.name.to_lowercase().as_str(), node.id)
+                        .map_err(storage)?;
+                    labels
+                        .remove(label_order_key(&node).as_str(), node.id)
                         .map_err(storage)?;
                 }
             }
@@ -306,6 +319,7 @@ impl GraphWriter {
         let mut qn = self.tx.open_multimap_table(QN_INDEX).map_err(storage)?;
         let mut names = self.tx.open_multimap_table(NAME_INDEX).map_err(storage)?;
         let mut files = self.tx.open_multimap_table(FILE_INDEX).map_err(storage)?;
+        let mut labels = self.tx.open_multimap_table(LABEL_ORDER).map_err(storage)?;
         for node_id in node_ids {
             if let Some(raw) = nodes.remove(*node_id).map_err(storage)? {
                 let node: Node = serde_json::from_slice(raw.value()).map_err(storage)?;
@@ -319,8 +333,49 @@ impl GraphWriter {
                         .remove(node.file_path.as_str(), node.id)
                         .map_err(storage)?;
                 }
+                labels
+                    .remove(label_order_key(&node).as_str(), node.id)
+                    .map_err(storage)?;
             }
         }
+        Ok(())
+    }
+
+    /// Replace the label index with one entry per node. Used once, when an
+    /// older graph is indexed again and the index does not yet cover every node.
+    pub fn rebuild_label_order(&self, nodes: &[Node]) -> Result<()> {
+        let mut table = self.tx.open_multimap_table(LABEL_ORDER).map_err(storage)?;
+        let existing: Vec<String> = table
+            .iter()
+            .map_err(storage)?
+            .map(|entry| {
+                entry
+                    .map(|(key, _)| key.value().to_string())
+                    .map_err(storage)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for key in existing {
+            table.remove_all(key.as_str()).map_err(storage)?;
+        }
+        for node in nodes {
+            table
+                .insert(label_order_key(node).as_str(), node.id)
+                .map_err(storage)?;
+        }
+        Ok(())
+    }
+
+    pub fn set_file_mtime(&self, path: &str, mtime_ns: u64) -> Result<()> {
+        let mut table = self.tx.open_table(FILES).map_err(storage)?;
+        let Some(raw) = table.get(path).map_err(storage)? else {
+            return Ok(());
+        };
+        let bytes = raw.value().to_vec();
+        drop(raw);
+        let mut record: FileRecord = serde_json::from_slice(&bytes).map_err(storage)?;
+        record.mtime_ns = mtime_ns;
+        let encoded = serde_json::to_vec(&record).map_err(storage)?;
+        table.insert(path, encoded.as_slice()).map_err(storage)?;
         Ok(())
     }
 
@@ -571,12 +626,72 @@ impl GraphReader {
     }
 
     pub fn nodes_in_file(&self, path: &str) -> Result<Vec<Node>> {
+        self.nodes_in_paths(&[path])
+    }
+
+    /// Every node defined in `paths`, with the file index opened once.
+    pub fn nodes_in_paths<S: AsRef<str>>(&self, paths: &[S]) -> Result<Vec<Node>> {
         let index = self.tx.open_multimap_table(FILE_INDEX).map_err(storage)?;
         let mut ids = Vec::new();
-        for entry in index.get(path).map_err(storage)? {
-            ids.push(entry.map_err(storage)?.value());
+        for path in paths {
+            for entry in index.get(path.as_ref()).map_err(storage)? {
+                ids.push(entry.map_err(storage)?.value());
+            }
         }
+        drop(index);
         self.load_nodes(&ids)
+    }
+
+    /// File-table keys, optionally bounded to those that start with `prefix`.
+    pub fn file_paths_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        let table = self.tx.open_table(FILES).map_err(storage)?;
+        let mut paths = Vec::new();
+        if prefix.is_empty() {
+            for entry in table.iter().map_err(storage)? {
+                let (key, _) = entry.map_err(storage)?;
+                paths.push(key.value().to_string());
+            }
+        } else {
+            for entry in table.range(prefix..).map_err(storage)? {
+                let (key, _) = entry.map_err(storage)?;
+                if !key.value().starts_with(prefix) {
+                    break;
+                }
+                paths.push(key.value().to_string());
+            }
+        }
+        Ok(paths)
+    }
+
+    /// One page of a label, already in search order, plus the full match count.
+    ///
+    /// Walks index keys only. Node bodies are loaded for the page, not for
+    /// every match.
+    pub fn label_page(
+        &self,
+        label: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<Node>, usize)> {
+        let table = self.tx.open_multimap_table(LABEL_ORDER).map_err(storage)?;
+        let prefix = format!("{label}\u{1}");
+        let mut total = 0usize;
+        let mut ids = Vec::new();
+        for entry in table.range(prefix.as_str()..).map_err(storage)? {
+            let (key, values) = entry.map_err(storage)?;
+            if !key.value().starts_with(&prefix) {
+                break;
+            }
+            for value in values {
+                let id = value.map_err(storage)?.value();
+                if total >= offset && ids.len() < limit {
+                    ids.push(id);
+                }
+                total += 1;
+            }
+        }
+        drop(table);
+        Ok((self.load_nodes(&ids)?, total))
     }
 
     /// Full node scan. Only for whole-graph reports such as get_architecture.
@@ -728,6 +843,16 @@ impl GraphReader {
         }
         Ok(nodes)
     }
+}
+
+fn label_order_key(node: &Node) -> String {
+    format!(
+        "{}\u{1}{}\u{1}{}\u{1}{:010}",
+        node.label.as_str(),
+        node.qualified_name,
+        node.file_path,
+        node.start_line
+    )
 }
 
 /// Convenience used by tests and by tools that only need one label filter.

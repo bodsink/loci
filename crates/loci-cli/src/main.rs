@@ -621,7 +621,10 @@ fn cmd_changes(project: &str, limit: usize, as_json: bool) -> Result<()> {
     }
     if report.total > 0 {
         println!();
-        println!("Run 'loci index {}' to refresh the graph.", entry.root);
+        println!(
+            "From the shell: loci index {} . A reloaded MCP server refreshes this project on the next tool call.",
+            entry.root
+        );
     }
     Ok(())
 }
@@ -745,7 +748,8 @@ mod tests {
 
     #[test]
     fn loci_ui_without_a_subcommand_still_starts() {
-        let cli = Cli::try_parse_from(["loci", "ui", "--port", "7421", "--no-open"]).expect("parse");
+        let cli =
+            Cli::try_parse_from(["loci", "ui", "--port", "7421", "--no-open"]).expect("parse");
         match cli.command {
             Command::Ui {
                 action: None,

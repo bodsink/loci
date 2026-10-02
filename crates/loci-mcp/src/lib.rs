@@ -5,6 +5,7 @@
 //! rather than through an SDK so the handshake stays under our control and the
 //! binary keeps no async runtime.
 
+pub mod freshness;
 pub mod handlers;
 pub mod journal;
 pub mod protocol;
@@ -128,7 +129,23 @@ pub fn handle_request(request: &Request) -> Value {
 
 /// Run the stdio server until the client closes stdin.
 pub fn serve_stdio<R: BufRead, W: Write>(input: R, output: W) -> std::io::Result<()> {
-    protocol::serve(input, output, handle_request)
+    let freshness = freshness::Freshness::start();
+    protocol::serve(input, output, move |request| {
+        if request.method == "tools/call" {
+            let name = request
+                .params
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let args = request
+                .params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            freshness.before_tool(name, &args);
+        }
+        handle_request(request)
+    })
 }
 
 #[cfg(test)]

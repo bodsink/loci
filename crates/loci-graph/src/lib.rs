@@ -156,6 +156,7 @@ mod tests {
                 reason: None,
                 detail: None,
                 node_ids: vec![1],
+                mtime_ns: 0,
             })
             .unwrap();
         writer.commit().unwrap();
@@ -231,5 +232,98 @@ mod tests {
         let second = GraphStore::open_read(&path).unwrap();
         assert_eq!(first.read().unwrap().node_count().unwrap(), 1);
         assert_eq!(second.read().unwrap().node_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn label_search_pages_in_qualified_name_order() {
+        let (_dir, store) = temp_store();
+        {
+            let writer = store.write().unwrap();
+            writer
+                .put_node(&function(1, "later", "pkg.b", "b.py", 3))
+                .unwrap();
+            writer
+                .put_node(&function(2, "earlier", "pkg.a", "a.py", 1))
+                .unwrap();
+            let mut method = function(3, "method", "pkg.m", "m.py", 9);
+            method.label = NodeLabel::Method;
+            writer.put_node(&method).unwrap();
+            let mut meta = ProjectMeta::new("sample".into(), "/tmp/sample".into());
+            meta.label_order = true;
+            writer.put_meta(&meta).unwrap();
+            writer.commit().unwrap();
+        }
+
+        let reader = store.read().unwrap();
+        let first = query::search(
+            &reader,
+            &query::SearchRequest {
+                label: Some("Function".into()),
+                limit: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(first.total, 2);
+        assert!(first.has_more);
+        assert_eq!(first.results[0].qualified_name, "pkg.a");
+
+        let second = query::search(
+            &reader,
+            &query::SearchRequest {
+                label: Some("Function".into()),
+                limit: Some(1),
+                offset: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(second.results[0].qualified_name, "pkg.b");
+        assert!(!second.has_more);
+    }
+
+    #[test]
+    fn file_pattern_search_reads_only_matching_paths() {
+        let (_dir, store) = temp_store();
+        {
+            let writer = store.write().unwrap();
+            writer
+                .put_node(&function(1, "alpha", "a.alpha", "a.py", 1))
+                .unwrap();
+            writer
+                .put_node(&function(2, "beta", "b.beta", "b.py", 1))
+                .unwrap();
+            for path in ["a.py", "b.py"] {
+                writer
+                    .put_file(&FileRecord {
+                        path: path.into(),
+                        hash: "h".into(),
+                        size: 1,
+                        language: Some(LanguageId::Python),
+                        status: CoverageStatus::Indexed,
+                        reason: None,
+                        detail: None,
+                        node_ids: Vec::new(),
+                        mtime_ns: 1,
+                    })
+                    .unwrap();
+            }
+            writer
+                .put_meta(&ProjectMeta::new("sample".into(), "/tmp/sample".into()))
+                .unwrap();
+            writer.commit().unwrap();
+        }
+
+        let reader = store.read().unwrap();
+        let found = query::search(
+            &reader,
+            &query::SearchRequest {
+                file_pattern: Some(r"^a\.py$".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(found.total, 1);
+        assert_eq!(found.results[0].qualified_name, "a.alpha");
     }
 }

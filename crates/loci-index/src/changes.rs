@@ -32,7 +32,9 @@ pub struct ChangeReport {
 }
 
 const NOTE: &str = "Compares the working tree against the hashes recorded at the last index run. \
-                    Run index_repository to bring the graph up to date.";
+                    A listed project is refreshed automatically before the next project tool when \
+                    a file was added, removed, or its mtime changed. index_repository is only \
+                    required for a repository that is not listed yet.";
 
 /// Compare the project root on disk with what the graph recorded.
 ///

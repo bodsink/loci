@@ -226,6 +226,7 @@ mod tests {
             reason: Some(reason),
             detail: None,
             node_ids: Vec::new(),
+            mtime_ns: 0,
         }
     }
 

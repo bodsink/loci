@@ -6,6 +6,7 @@ use loci_graph::{
     Edge, EdgeType, Evidence, GraphStore, NodeLabel,
 };
 use loci_index::{changes, walk::IgnoreMatcher, IndexOptions};
+use rayon::prelude::*;
 use serde_json::{json, Value};
 use std::path::Path;
 
@@ -799,7 +800,7 @@ pub fn search_code(args: &Value) -> Result<Value> {
     let limit = limit_from(args, 50);
     let offset = offset_from(args)?;
 
-    let mut hits = Vec::new();
+    let mut paths = Vec::new();
     for record in reader.all_files()? {
         if record.status == loci_graph::CoverageStatus::Skipped {
             continue;
@@ -809,10 +810,24 @@ pub fn search_code(args: &Value) -> Result<Value> {
                 continue;
             }
         }
-        let Ok(content) = sandbox.read_to_string(&record.path) else {
-            continue;
-        };
+        paths.push(record.path);
+    }
 
+    // Reading the files is the cost. Matching stays sequential so the result
+    // order is fixed by the sort below, not by which read finished first.
+    let loaded: Vec<(String, String)> = paths
+        .par_iter()
+        .filter_map(|path| {
+            sandbox
+                .read_to_string(path)
+                .ok()
+                .map(|content| (path.clone(), content))
+        })
+        .collect();
+
+    let mut hits = Vec::new();
+    for (path, content) in &loaded {
+        let mut symbols = None;
         for (index, line) in content.lines().enumerate() {
             let matched = match &matcher {
                 Some(re) => re.is_match(line),
@@ -829,9 +844,14 @@ pub fn search_code(args: &Value) -> Result<Value> {
             }
 
             let line_number = index as u32 + 1;
-            let containing = reader
-                .nodes_in_file(&record.path)?
-                .into_iter()
+            if symbols.is_none() {
+                symbols = Some(reader.nodes_in_file(path)?);
+            }
+            let Some(nodes) = symbols.as_ref() else {
+                continue;
+            };
+            let containing = nodes
+                .iter()
                 .filter(|n| {
                     n.label != NodeLabel::File
                         && n.start_line <= line_number
@@ -840,7 +860,7 @@ pub fn search_code(args: &Value) -> Result<Value> {
                 .min_by_key(|n| n.end_line - n.start_line);
 
             hits.push(json!({
-                "file_path": record.path,
+                "file_path": path,
                 "line": line_number,
                 "text": line.trim_end().chars().take(400).collect::<String>(),
                 "in_symbol": containing.map(|n| json!({

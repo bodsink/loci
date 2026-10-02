@@ -10,6 +10,9 @@ pub struct Candidate {
     pub relative_path: String,
     pub absolute_path: PathBuf,
     pub size: u64,
+    /// mtime in nanoseconds since the unix epoch. Zero when the filesystem
+    /// did not report one.
+    pub mtime_ns: u64,
     pub language: Option<LanguageId>,
 }
 
@@ -69,12 +72,20 @@ pub fn collect(sandbox: &Sandbox) -> Vec<Candidate> {
         let Ok(relative) = sandbox.relativize(absolute) else {
             continue;
         };
-        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        let metadata = entry.metadata().ok();
+        let size = metadata.as_ref().map(|meta| meta.len()).unwrap_or(0);
+        let mtime_ns = metadata
+            .as_ref()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos() as u64)
+            .unwrap_or(0);
 
         candidates.push(Candidate {
             relative_path: to_slash(&relative),
             absolute_path: absolute.to_path_buf(),
             size,
+            mtime_ns,
             language: detect_language(absolute, size),
         });
     }
