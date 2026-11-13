@@ -149,7 +149,11 @@ and `.gitignore` is honoured.
 to graph symbols), `ingest_traces` (attach runtime call data)
 
 Every response carries concrete file paths and line ranges, paginates with `has_more`/`cursor`, and
-reports empty results as empty.
+reports empty results as empty. When `has_more` is true the payload also includes `next_step`,
+naming that cursor and telling the caller to repeat the same tool with the other arguments
+unchanged before concluding. A tool that already sets `next_step`, such as `list_projects`, keeps
+its own sentence and the page instruction is appended. A page that fits in one response does not
+gain a `next_step` from this.
 
 See [`docs/cursor-agent.md`](docs/cursor-agent.md) for how the tools are shaped around the way
 Cursor's agent actually behaves.

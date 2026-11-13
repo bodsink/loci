@@ -32,6 +32,7 @@ pub fn call_tool(name: &str, args: &Value) -> (Value, bool) {
             let soft_error = value.get("error").is_some();
             if let Some(object) = value.as_object_mut() {
                 object.insert("duration_ms".to_string(), json!(duration_ms));
+                attach_page_hint(object);
             }
             (value, soft_error)
         }
@@ -45,6 +46,40 @@ pub fn call_tool(name: &str, args: &Value) -> (Value, bool) {
             true,
         ),
     }
+}
+
+/// A truncated page already carries `has_more` and `cursor`. Name that cursor
+/// in `next_step`. An existing instruction is kept and the page sentence is
+/// appended; `list_projects` always sets `next_step`, including on a short page.
+fn attach_page_hint(object: &mut serde_json::Map<String, Value>) {
+    if object.get("has_more").and_then(Value::as_bool) != Some(true) {
+        return;
+    }
+    let Some(cursor) = object.get("cursor").and_then(Value::as_str) else {
+        return;
+    };
+    let cursor = cursor.to_string();
+    let marker = format!("cursor \"{cursor}\"");
+    if object
+        .get("next_step")
+        .and_then(Value::as_str)
+        .is_some_and(|step| step.contains(&marker))
+    {
+        return;
+    }
+    let page = match object.get("total").and_then(Value::as_u64) {
+        Some(total) => format!(
+            "has_more is true ({total} total). This page is not the full result. Call this same tool again with cursor \"{cursor}\" and the other arguments unchanged before concluding."
+        ),
+        None => format!(
+            "has_more is true. This page is not the full result. Call this same tool again with cursor \"{cursor}\" and the other arguments unchanged before concluding."
+        ),
+    };
+    let hint = match object.get("next_step").and_then(Value::as_str) {
+        Some(existing) if !existing.is_empty() => format!("{existing} {page}"),
+        _ => page,
+    };
+    object.insert("next_step".to_string(), json!(hint));
 }
 
 /// What the agent should do next after a given failure. Agents follow concrete
