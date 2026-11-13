@@ -272,12 +272,7 @@ fn resolve_recorded_project(
     aliases: &BTreeMap<String, String>,
 ) -> Option<String> {
     let raw = recorded.filter(|id| !id.is_empty())?;
-    Some(
-        aliases
-            .get(raw)
-            .cloned()
-            .unwrap_or_else(|| raw.to_string()),
-    )
+    Some(aliases.get(raw).cloned().unwrap_or_else(|| raw.to_string()))
 }
 
 fn empty_summary(journal_path: String, window: &str, since_unix: Option<i64>) -> UsageSummary {
@@ -472,7 +467,10 @@ fn summarise_entries(
         .count();
     summary.criteria.pagination_needed = summary.truncated_responses;
     summary.criteria.pagination_followed = summary.paged_followthrough;
-    summary.sessions = sessions.iter().map(|session| session_usage(session, aliases)).collect();
+    summary.sessions = sessions
+        .iter()
+        .map(|session| session_usage(session, aliases))
+        .collect();
 
     summary
 }
@@ -687,7 +685,15 @@ mod tests {
     fn a_day_window_drops_calls_older_than_the_cutoff() {
         let entries = vec![
             entry(100, "list_projects", None, true, 0, &[], None),
-            entry(2000, "search_graph", Some("alpha"), true, 4, &["project"], None),
+            entry(
+                2000,
+                "search_graph",
+                Some("alpha"),
+                true,
+                4,
+                &["project"],
+                None,
+            ),
         ];
         let summary = summarise_entries(
             &entries,
@@ -746,7 +752,15 @@ mod tests {
         );
         missing.error_code = Some("project_not_found".into());
         let entries = vec![
-            entry(1, "detect_changes", Some("alpha"), true, 3, &["project"], None),
+            entry(
+                1,
+                "detect_changes",
+                Some("alpha"),
+                true,
+                3,
+                &["project"],
+                None,
+            ),
             entry(
                 2,
                 "check_index_coverage",
